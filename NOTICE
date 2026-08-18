@@ -1,0 +1,49 @@
+Crimson Desert RX 580 Fix
+Copyright 2026 Vidith007
+
+This product includes software developed as original work for this project,
+licensed under the Apache License, Version 2.0. See LICENSE.
+
+------------------------------------------------------------------------------
+This distribution ALSO contains binaries that are not covered by the Apache
+License, Version 2.0. Redistributing this package means complying with their
+terms as well as Apache-2.0.
+
+  fix/vkd3d/d3d12core.dll
+  fix/vkd3d/d3d12.dll
+      vkd3d-proton, version 3.0.1, MODIFIED.
+      Licensed under the GNU Lesser General Public License, version 2.1
+      or (at your option) any later version.
+      Copyright the vkd3d and vkd3d-proton authors; see
+      fix/licenses/vkd3d-proton-AUTHORS.txt
+      Upstream: https://github.com/HansKristian-Work/vkd3d-proton
+
+      Because these are MODIFIED builds, LGPL-2.1 sections 4 and 6 require
+      the corresponding modified source to accompany them. It is provided
+      as:
+          source/vkd3d-proton-3.0.1-rx580-polaris.patch
+      applied against upstream tag v3.0.1.
+
+  Vendored inside the above:
+      dxil-spirv  - MIT - Copyright (c) 2019-2022 Hans-Kristian Arntzen
+                    for Valve Corporation
+      bc-decoder  - MIT - Copyright (c) Baldur Karlsson
+      glslang     - MIT / BSD-3-Clause - The Khronos Group Inc.
+      SPIRV-Cross, SPIRV-Tools, SPIRV-Headers
+                  - Apache-2.0 / MIT - The Khronos Group Inc.
+
+Full details, including what was changed in each file and how to reproduce
+the build, are in THIRD-PARTY-NOTICES.md.
+------------------------------------------------------------------------------
+
+NOT DISTRIBUTED HERE:
+
+  AMD's Vulkan driver (amdvlk64.dll) is stock and unmodified. It comes from
+  your own Radeon Software installation. No AMD file is replaced, patched or
+  redistributed.
+
+  No Crimson Desert file is modified or redistributed. Crimson Desert is the
+  property of Pearl Abyss Corp. This package contains none of it.
+
+This project is unofficial and unaffiliated with AMD, Valve Corporation or
+Pearl Abyss.

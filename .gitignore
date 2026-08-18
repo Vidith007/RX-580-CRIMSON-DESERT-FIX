@@ -1,0 +1,56 @@
+# Never commit these
+
+# Windows / macOS cruft
+Thumbs.db
+desktop.ini
+ehthumbs.db
+.DS_Store
+
+# Editors
+*.swp
+*~
+.vscode/
+.idea/
+
+# Runtime logs the shim writes into bin64. They are truncated every launch
+# and are machine-specific.
+*.log
+dx12bridge.d3d12.log
+dx12bridge.dxgi.log
+vkd3d-capture2.log
+rx580-cache-guard.log
+
+# Backups. Keep these on your own disk, not in the repo.
+*.bak
+*.bak-*
+backup-original/
+backup-previous/
+_*_backup/
+
+# Shader and pipeline caches. Machine-specific and enormous - a bloated one
+# is the single most common cause of the "Compiling Shaders" hang, and it must
+# never be shipped to anyone.
+*.cache
+vkd3d-proton.cache
+DxcCache/
+VkCache/
+DxCache/
+
+# Diagnostic dumps from development
+shader-dump/
+shader-dump-*/
+shaderdump/
+shader-override/
+shader-substitute/
+pso-hang/
+logs-archive/
+_logs-archive/
+captures/
+
+# Build artefacts
+*.pdb
+*.ilk
+*.exp
+*.obj
+*.o
+build/

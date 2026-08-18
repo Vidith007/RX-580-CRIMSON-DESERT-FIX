@@ -1,0 +1,1033 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Crimson Desert on a Radeon RX 580 — a driver-shim engineering report</title>
+<meta name="description" content="How Crimson Desert was made to run on an AMD RX 580 (Polaris/GCN4): twelve root causes, forty-eight refuted hypotheses, and the measurement that decided each one.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Condensed:wght@400;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&display=swap" rel="stylesheet">
+<style>
+/* ==========================================================================
+   Palette. Sampled, not chosen at random:
+     paper/ink  - the register of a driver-team engineering memo
+     blueprint  - structure, links, the signal path
+     oxide      - REFUTED and FAILED only. It never decorates.
+     olive      - CONFIRMED and FIXED only. Sampled from the game's own foliage.
+   AMD's Polaris-era driver suite shipped as Radeon Software Crimson Edition.
+   That is the document this page is dressed as.
+   ========================================================================== */
+:root{
+  --paper:#E8EAEE;
+  --paper-2:#DDE0E6;
+  --ink:#15181C;
+  --ink-60:#5C636E;
+  --ink-35:#9AA1AC;
+  --rule:#C3C8D1;
+  --blueprint:#2B5A87;
+  --blueprint-lite:#EAF0F6;
+  --oxide:#A22B22;
+  --oxide-lite:#F7EAE8;
+  --olive:#4E6B33;
+  --olive-lite:#EDF1E6;
+  --void:#0A0B0C;
+
+  --display:"IBM Plex Sans Condensed","Roboto Condensed","Arial Narrow",system-ui,sans-serif;
+  --body:"Source Serif 4","Iowan Old Style",Georgia,"Times New Roman",serif;
+  --mono:"IBM Plex Mono","SFMono-Regular",Consolas,"Liberation Mono",monospace;
+
+  --gut:clamp(18px,4vw,40px);
+  --col:1100px;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{
+  margin:0;background:var(--paper);color:var(--ink);
+  font-family:var(--body);font-size:clamp(16px,1.02vw + 13px,18.5px);
+  line-height:1.62;font-variant-numeric:tabular-nums;
+  text-rendering:optimizeLegibility;
+}
+img{max-width:100%;display:block}
+a{color:var(--blueprint);text-decoration:none;border-bottom:1px solid rgba(43,90,135,.32)}
+a:hover{border-bottom-color:var(--blueprint)}
+a:focus-visible,button:focus-visible,[tabindex]:focus-visible{outline:2.5px solid var(--blueprint);outline-offset:3px}
+
+.wrap{max-width:var(--col);margin:0 auto;padding:0 var(--gut)}
+.narrow{max-width:720px}
+
+/* ---------- display type ---------- */
+h1,h2,h3,h4,.eyebrow,.stat b,.tag,th,.lede{font-family:var(--display)}
+h2{
+  font-size:clamp(28px,3.1vw,44px);font-weight:700;line-height:1.02;
+  letter-spacing:-.017em;margin:0 0 .1em;
+}
+h3{font-size:clamp(19px,1.5vw,23px);font-weight:600;line-height:1.2;letter-spacing:-.008em;margin:2.4em 0 .5em}
+h4{font-size:16px;font-weight:600;letter-spacing:.02em;margin:1.9em 0 .35em}
+p{margin:0 0 1.05em}
+.lede{font-size:clamp(19px,1.5vw,23px);line-height:1.42;color:var(--ink);font-weight:400;letter-spacing:-.005em}
+.eyebrow{
+  font-size:12px;font-weight:600;letter-spacing:.17em;text-transform:uppercase;
+  color:var(--ink-60);margin:0 0 .9em;
+}
+.mono{font-family:var(--mono);font-size:.855em;letter-spacing:-.01em}
+code{font-family:var(--mono);font-size:.845em;background:var(--paper-2);padding:.1em .34em;border-radius:2px;word-break:break-word}
+.small{font-size:14.5px;line-height:1.5;color:var(--ink-60)}
+
+/* ==========================================================================
+   HERO — the thesis. Left: the black frame this project stared at for six
+   days. Right: the frame that ended it. Drag the seam.
+   ========================================================================== */
+.hero{background:var(--void);color:#EDEFF2;position:relative;overflow:hidden}
+.hero-inner{max-width:var(--col);margin:0 auto;padding:clamp(30px,6vh,64px) var(--gut) 0}
+.hero .eyebrow{color:#7E8794;border-top:1px solid #23272D;padding-top:14px}
+.hero h1{
+  font-family:var(--display);font-weight:700;
+  font-size:clamp(42px,8.6vw,116px);line-height:.92;letter-spacing:-.032em;
+  margin:0 0 .32em;text-wrap:balance;
+}
+.hero h1 i{font-style:normal;color:#6E7681}
+.hero-sub{
+  display:grid;grid-template-columns:repeat(auto-fit,minmax(148px,1fr));
+  gap:20px 26px;border-top:1px solid #23272D;padding:18px 0 26px;
+}
+.hero-sub div{font-family:var(--mono);font-size:12.5px;line-height:1.5;color:#8B939F}
+.hero-sub b{display:block;font-family:var(--display);font-size:23px;font-weight:600;color:#F2F4F7;letter-spacing:-.01em}
+.hero-sub b.ok{color:#8FB463}
+
+/* drag-compare */
+.cmp{position:relative;max-width:var(--col);margin:0 auto;padding:0 var(--gut) clamp(28px,5vh,52px)}
+.cmp-stage{position:relative;aspect-ratio:16/9;background:#000;overflow:hidden;cursor:ew-resize;
+  border:1px solid #23272D;touch-action:none}
+.cmp-stage img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;pointer-events:none}
+.cmp-after{clip-path:inset(0 0 0 var(--seam,52%))}
+.cmp-line{position:absolute;top:0;bottom:0;left:var(--seam,52%);width:1px;background:#F2F4F7;pointer-events:none}
+.cmp-grip{
+  position:absolute;top:50%;left:var(--seam,52%);transform:translate(-50%,-50%);
+  width:44px;height:44px;border-radius:50%;background:#F2F4F7;color:var(--void);
+  display:grid;place-items:center;font-family:var(--mono);font-size:13px;font-weight:600;
+  box-shadow:0 2px 14px rgba(0,0,0,.5);border:0;padding:0;cursor:ew-resize;
+  touch-action:none;
+}
+.cmp-grip:focus-visible{outline:3px solid #F2F4F7;outline-offset:4px}
+.cmp-tag{
+  position:absolute;bottom:0;font-family:var(--mono);font-size:11px;letter-spacing:.1em;
+  text-transform:uppercase;background:rgba(10,11,12,.82);color:#C8CDD5;
+  padding:7px 11px;pointer-events:none;
+}
+.cmp-tag.l{left:0}.cmp-tag.r{right:0}
+.cmp-cap{font-family:var(--mono);font-size:12px;color:#717985;padding-top:11px;line-height:1.55}
+
+/* ==========================================================================
+   SECTIONS
+   ========================================================================== */
+section{padding:clamp(52px,7.5vh,92px) 0;border-top:1px solid var(--rule)}
+section:first-of-type{border-top:0}
+.sec-head{display:flex;gap:clamp(16px,3vw,44px);align-items:baseline;margin-bottom:2.1em;flex-wrap:wrap}
+.sec-no{
+  font-family:var(--mono);font-size:13px;font-weight:500;color:var(--ink-35);
+  padding-top:.55em;flex:0 0 auto;letter-spacing:.04em;
+}
+.sec-head .lede{max-width:640px;margin:.5em 0 0}
+
+/* ---------- the margin delta: this page's structural device.
+   Every claim carries the number that decided it. ---------- */
+.delta{
+  font-family:var(--mono);font-size:12.5px;font-weight:500;letter-spacing:-.01em;
+  display:inline-block;padding:3px 8px;border-radius:2px;white-space:nowrap;
+}
+.delta.fix{background:var(--olive-lite);color:var(--olive);border:1px solid #C9D6B4}
+.delta.no{background:var(--oxide-lite);color:var(--oxide);border:1px solid #E6C6C1}
+.delta.neu{background:var(--blueprint-lite);color:var(--blueprint);border:1px solid #C9D8E6}
+
+/* ---------- fault cards ---------- */
+.faults{display:grid;gap:1px;background:var(--rule);border:1px solid var(--rule)}
+.fault{background:var(--paper);padding:clamp(20px,2.4vw,30px)}
+.fault-top{display:flex;justify-content:space-between;gap:18px;align-items:flex-start;margin-bottom:.7em;flex-wrap:wrap}
+.fault-id{font-family:var(--mono);font-size:12px;color:var(--ink-35);letter-spacing:.06em}
+.fault h3{margin:.1em 0 .55em;font-size:clamp(20px,1.75vw,26px)}
+.fault p{margin:0 0 .75em;max-width:66ch}
+.fault p:last-child{margin-bottom:0}
+.where{font-family:var(--mono);font-size:12.5px;color:var(--ink-60);margin-top:1em;padding-top:.85em;border-top:1px dotted var(--rule)}
+
+/* ---------- tables ---------- */
+.tbl{width:100%;border-collapse:collapse;margin:1.4em 0;font-family:var(--mono);font-size:13.5px}
+.tbl th{
+  font-family:var(--display);font-size:12px;font-weight:600;letter-spacing:.12em;
+  text-transform:uppercase;color:var(--ink-60);text-align:left;
+  padding:0 12px .6em 0;border-bottom:1.5px solid var(--ink);
+}
+.tbl td{padding:.62em 12px .62em 0;border-bottom:1px solid var(--rule);vertical-align:top}
+.tbl td:first-child,.tbl th:first-child{padding-left:0}
+.tbl .n{text-align:right;padding-right:20px}
+.tbl tr:last-child td{border-bottom:1.5px solid var(--ink)}
+.tbl tfoot td{font-weight:600;color:var(--ink)}
+.scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+
+/* ---------- the LEDGER: signature element ---------- */
+.ledger{border:1.5px solid var(--ink);background:#fff}
+.ledger-head{
+  display:grid;grid-template-columns:1fr 1fr;font-family:var(--display);
+  font-size:12px;font-weight:600;letter-spacing:.13em;text-transform:uppercase;
+}
+.ledger-head span{padding:12px 16px}
+.ledger-head span:first-child{background:var(--olive);color:#F2F4F7}
+.ledger-head span:last-child{background:var(--oxide);color:#F7EAE8}
+.ledger-body{display:grid;grid-template-columns:1fr 1fr}
+.ledger-col{padding:6px 0}
+.ledger-col+.ledger-col{border-left:1.5px solid var(--ink)}
+.lrow{padding:11px 16px;border-bottom:1px solid var(--rule);display:flex;gap:12px;align-items:flex-start}
+.lrow:last-child{border-bottom:0}
+.lrow .k{
+  font-family:var(--mono);font-size:11px;font-weight:600;flex:0 0 auto;margin-top:.28em;
+  width:2.1em;text-align:right;color:var(--ink-35);
+}
+.lrow .t{font-family:var(--display);font-size:15.5px;line-height:1.3;font-weight:600}
+.lrow .m{font-family:var(--mono);font-size:11.5px;line-height:1.45;color:var(--ink-60);display:block;margin-top:.32em;font-weight:400}
+.lrow.win .t{color:var(--olive)}
+.lrow.lose .t{color:var(--oxide)}
+.ledger-foot{border-top:1.5px solid var(--ink);padding:13px 16px;font-family:var(--mono);font-size:12px;color:var(--ink-60)}
+
+/* ---------- architecture diagram ---------- */
+.arch{background:#fff;border:1.5px solid var(--ink);padding:clamp(16px,2.4vw,32px);margin:1.6em 0}
+.arch svg{width:100%;height:auto;display:block}
+.taps{display:grid;grid-template-columns:repeat(auto-fit,minmax(258px,1fr));gap:0 30px;margin-top:1.9em;
+  border-top:1px solid var(--rule);padding-top:1.5em}
+.tap{display:flex;gap:12px;padding:.62em 0;border-bottom:1px dotted var(--rule)}
+.tap b{
+  font-family:var(--mono);font-size:11px;font-weight:600;color:#fff;background:var(--blueprint);
+  width:20px;height:20px;border-radius:50%;display:grid;place-items:center;flex:0 0 auto;margin-top:.2em;
+}
+.tap span{font-size:15px;line-height:1.44}
+.tap i{font-style:normal;font-family:var(--mono);font-size:12.5px;color:var(--ink-60);display:block}
+
+/* ---------- stat strip ---------- */
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(158px,1fr));gap:1px;background:var(--rule);
+  border:1px solid var(--rule);margin:1.9em 0}
+.stat{background:var(--paper);padding:18px 20px}
+.stat b{display:block;font-size:clamp(26px,2.7vw,38px);font-weight:700;line-height:1;letter-spacing:-.022em}
+.stat span{display:block;font-family:var(--mono);font-size:11.5px;line-height:1.42;color:var(--ink-60);margin-top:.62em}
+.stat.ok b{color:var(--olive)}
+.stat.no b{color:var(--oxide)}
+
+/* ---------- callout ---------- */
+.note{border-left:3px solid var(--blueprint);background:var(--blueprint-lite);padding:16px 20px;margin:1.6em 0}
+.note.warn{border-left-color:var(--oxide);background:var(--oxide-lite)}
+.note.good{border-left-color:var(--olive);background:var(--olive-lite)}
+.note p:last-child{margin-bottom:0}
+.note h4{margin-top:0}
+
+/* ---------- steps (a real ordered procedure — numbering earns its place) ---------- */
+.steps{list-style:none;counter-reset:s;padding:0;margin:1.6em 0}
+.steps li{counter-increment:s;position:relative;padding:0 0 1.4em 3.1em;border-bottom:1px solid var(--rule);margin-bottom:1.4em}
+.steps li:last-child{border-bottom:0}
+.steps li::before{
+  content:counter(s);position:absolute;left:0;top:.06em;
+  font-family:var(--mono);font-size:13px;font-weight:600;color:#fff;background:var(--ink);
+  width:26px;height:26px;border-radius:50%;display:grid;place-items:center;
+}
+.steps h4{margin:.05em 0 .3em}
+.steps p{margin:0 0 .5em}
+
+/* ---------- figures ---------- */
+.figs{display:grid;grid-template-columns:repeat(auto-fit,minmax(288px,1fr));gap:clamp(14px,2vw,26px);margin:1.9em 0}
+figure{margin:0}
+figure img{border:1px solid var(--rule);background:#000}
+figcaption{font-family:var(--mono);font-size:12px;line-height:1.5;color:var(--ink-60);padding-top:9px}
+
+/* ---------- credits ---------- */
+.credit{padding:1.15em 0;border-bottom:1px solid var(--rule);display:grid;
+  grid-template-columns:minmax(180px,1fr) 2.1fr;gap:6px 30px}
+.credit:last-of-type{border-bottom:0}
+.credit b{font-family:var(--display);font-size:17.5px;font-weight:600;letter-spacing:-.004em}
+.credit b em{font-style:normal;display:block;font-family:var(--mono);font-size:11.5px;font-weight:400;
+  color:var(--ink-60);letter-spacing:.03em;margin-top:.28em}
+.credit p{margin:0;font-size:16px}
+
+footer{background:var(--void);color:#8B939F;padding:clamp(40px,6vh,64px) 0;font-family:var(--mono);font-size:12.5px;line-height:1.72}
+footer b{color:#EDEFF2;font-weight:500}
+footer a{color:#9FB7CE;border-bottom-color:rgba(159,183,206,.3)}
+
+/* ---------- reveal ---------- */
+@media (prefers-reduced-motion:no-preference){
+  .rv{opacity:0;transform:translateY(14px);transition:opacity .62s cubic-bezier(.2,.7,.3,1),transform .62s cubic-bezier(.2,.7,.3,1)}
+  .rv.in{opacity:1;transform:none}
+}
+
+@media (max-width:720px){
+  .ledger-head,.ledger-body{grid-template-columns:1fr}
+  .ledger-col+.ledger-col{border-left:0;border-top:1.5px solid var(--ink)}
+  .credit{grid-template-columns:1fr}
+  .sec-head{display:block}
+  .sec-no{padding:0 0 .7em}
+}
+@media print{
+  .hero{background:#fff;color:#000}
+  .hero h1,.hero-sub b{color:#000}
+  section{page-break-inside:avoid}
+}
+</style>
+</head>
+<body>
+
+<!-- ======================================================================
+     HERO
+     ====================================================================== -->
+<header class="hero">
+  <div class="hero-inner">
+    <p class="eyebrow">Engineering report &nbsp;/&nbsp; 11–18 August 2026 &nbsp;/&nbsp; single workstation, single card</p>
+    <h1>Crimson&nbsp;Desert<br><i>on a card that</i><br>cannot run it</h1>
+    <div class="hero-sub">
+      <div><b>RX 580 2048SP</b>Polaris 20 · GCN4 · 8 GB</div>
+      <div><b>12_0</b>highest feature level the card reports</div>
+      <div><b>12_1</b>feature level the game demands</div>
+      <div><b class="ok">Playable</b>day and night, textured, 39 draws/frame</div>
+    </div>
+  </div>
+
+  <div class="cmp">
+    <div class="cmp-stage" id="cmp" role="group" aria-label="Drag to compare: the compile-screen hang against working gameplay">
+      <img src="paper/figures/before-compile-wedge.jpg" alt="A black frame with a faint grey wedge: the Compiling Shaders screen, where the game hung indefinitely.">
+      <img class="cmp-after" src="paper/figures/after-gameplay-day.jpg" alt="Crimson Desert rendering in daylight on the RX 580: terrain, foliage, buildings and character all present and textured.">
+      <div class="cmp-line" aria-hidden="true"></div>
+      <button type="button" class="cmp-grip" id="grip" role="slider"
+              aria-label="Comparison seam — drag, or use the left and right arrow keys"
+              aria-valuemin="0" aria-valuemax="100" aria-valuenow="52">↔</button>
+      <span class="cmp-tag l">Before · frame 0–∞</span>
+      <span class="cmp-tag r">After · in game</span>
+    </div>
+    <p class="cmp-cap">Left: six days of this. 82 fps, a black frame, and a shader-compile worker that had already died. Right: the same binary after the twelfth root cause. Drag the seam, or use the arrow keys.</p>
+  </div>
+</header>
+
+
+<!-- ======================================================================
+     ABSTRACT
+     ====================================================================== -->
+<section>
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="sec-no">ABSTRACT</span>
+      <div>
+        <h2>What this is</h2>
+        <p class="lede">Crimson Desert refuses to start on a Radeon RX 580. It queries Direct3D&nbsp;12 feature level 12_1 and native 16-bit float support; Polaris advertises neither. This is the record of closing that gap — a translation shim, nine patched files in vkd3d-proton, and twelve distinct driver-level faults, each one identified by a measurement rather than a guess.</p>
+      </div>
+    </div>
+
+    <div class="narrow">
+      <p>The card is an RX 580 2048SP: Polaris 20, GCN generation 4, 8&nbsp;GB of VRAM, in a box with 8&nbsp;GB of system RAM. It is a 2018 mid-range part. The game is a 2026 open-world title built against a feature level the silicon does not implement.</p>
+      <p>Nothing here overclocks, flashes firmware, or replaces AMD's driver. The work sits in one layer: a <code>d3d12.dll</code> that the game loads instead of Microsoft's, which answers capability queries honestly enough to get past the gate and then repairs the shader bytecode and command stream on the way down to Vulkan. Everything below it — amdvlk64, the kernel driver, the card — is stock.</p>
+      <p>The interesting part is not the fixes. It is the ratio. Twelve faults were confirmed. <strong>Forty-eight hypotheses were refuted</strong>, several of them extremely plausible and held for hours. Forty-four times a measurement lied and had to be re-taken. That ratio is the actual finding, and §4 is where it lives.</p>
+      <div class="note">
+        <h4>Honest status</h4>
+        <p>The game reaches gameplay, renders correctly in daylight and at night, and shows no missing or substituted textures. The <strong>title-screen background is still black</strong> — diagnosed, not fixed, and §7 explains exactly why it was left alone. Commit headroom is thin on 8&nbsp;GB. This is a working build, not a finished product.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ======================================================================
+     §1 THE GAP
+     ====================================================================== -->
+<section>
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="sec-no">§ 1</span>
+      <div>
+        <h2>The gap</h2>
+        <p class="lede">Four hard requirements, four things the card does not have. Each one had to be answered somewhere in the stack.</p>
+      </div>
+    </div>
+
+    <div class="scroll">
+      <table class="tbl">
+        <thead><tr><th>The game asks for</th><th>Polaris / amdvlk64 actually reports</th><th>Where it was answered</th></tr></thead>
+        <tbody>
+          <tr><td>D3D12 feature level <strong>12_1</strong></td><td><span style="color:var(--oxide)">12_0</span> — no conservative raster tier&nbsp;3, no ROVs</td><td>Shim forges the <code>CheckFeatureSupport</code> reply</td></tr>
+          <tr><td><strong>Native fp16</strong> in shaders</td><td><span style="color:var(--oxide)">shaderFloat16 = false</span> on this driver</td><td>Shim forges the capability; fp16 arithmetic is demoted in the SPIR-V</td></tr>
+          <tr><td><code>[WaveSize(32)]</code> compute shaders</td><td><span style="color:var(--oxide)">subgroup size fixed at 64</span> (GCN wave64)</td><td>Shim forges <code>minSubgroupSize</code> to 16 so validation admits 32</td></tr>
+          <tr><td><strong>Device-generated commands</strong> (DGC)</td><td><span style="color:var(--oxide)">extension absent</span></td><td>Root arguments unrolled into a compute pass — see fault 07</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p class="narrow small">A forged capability is a promise. Every one of the four above created a second problem downstream — the thing that was promised then has to actually work. Faults 05, 06, 07 and 08 are all bills that came due for lines in this table.</p>
+  </div>
+</section>
+
+
+<!-- ======================================================================
+     §2 ARCHITECTURE
+     ====================================================================== -->
+<section>
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="sec-no">§ 2</span>
+      <div>
+        <h2>Where the work sits</h2>
+        <p class="lede">The signal path from the game's D3D12 call to a lit pixel, and the eight points on it that were changed.</p>
+      </div>
+    </div>
+
+    <div class="arch rv">
+      <svg viewBox="0 0 900 604" role="img" aria-labelledby="archt archd">
+        <title id="archt">Signal path from CrimsonDesert.exe to Polaris silicon</title>
+        <desc id="archd">A vertical stack of six layers. CrimsonDesert.exe calls into a replacement d3d12.dll shim, which chains to a patched vkd3d-proton, which uses dxil-spirv to translate shader bytecode, then hands Vulkan work to the stock amdvlk64 driver and the Polaris card. Eight numbered taps mark the modified points: three in the shim, three in vkd3d-proton, one in the SPIR-V post-pass, and one launch-time cache guard.</desc>
+        <defs>
+          <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M0 0 L10 5 L0 10 z" fill="#2B5A87"/>
+          </marker>
+          <style>
+            .bx{fill:#fff;stroke:#15181C;stroke-width:1.5}
+            .bx-o{fill:#EAF0F6;stroke:#2B5A87;stroke-width:1.5}
+            .bx-s{fill:#F4F5F7;stroke:#9AA1AC;stroke-width:1.5;stroke-dasharray:5 3}
+            .t{font-family:'IBM Plex Sans Condensed',sans-serif;font-weight:600;font-size:17px;fill:#15181C}
+            .st{font-family:'IBM Plex Mono',monospace;font-size:11.5px;fill:#5C636E}
+            .st2{font-family:'IBM Plex Mono',monospace;font-size:11px;fill:#9AA1AC}
+            .fl{stroke:#2B5A87;stroke-width:1.5;fill:none}
+            .tapc{fill:#2B5A87}
+            .tapt{font-family:'IBM Plex Mono',monospace;font-size:11px;font-weight:600;fill:#fff}
+            .lbl{font-family:'IBM Plex Mono',monospace;font-size:11px;fill:#2B5A87}
+          </style>
+        </defs>
+
+        <!-- game -->
+        <rect class="bx-s" x="150" y="8" width="600" height="52" rx="2"/>
+        <text class="t" x="170" y="32">CrimsonDesert.exe</text>
+        <text class="st" x="170" y="49">Pearl Abyss · GameVersion 1.14.00 · D3D12 renderer</text>
+
+        <path class="fl" d="M450 60 L450 92" marker-end="url(#ar)"/>
+        <text class="lbl" x="462" y="81">LoadLibrary("d3d12.dll")</text>
+
+        <!-- shim -->
+        <rect class="bx-o" x="80" y="94" width="740" height="130" rx="2"/>
+        <text class="t" x="100" y="120">d3d12.dll — the shim  <tspan class="st">(dx12bridge)</tspan></text>
+        <text class="st" x="100" y="139">11,041 lines of C++ across 38 files · 997-line .ini · no game files touched</text>
+        <circle class="tapc" cx="112" cy="167" r="10"/><text class="tapt" x="112" y="171" text-anchor="middle">1</text>
+        <text class="st" x="130" y="164">Capability forge</text><text class="st2" x="130" y="178">FL 12_1 · fp16 · subgroup 16..64</text>
+        <circle class="tapc" cx="352" cy="167" r="10"/><text class="tapt" x="352" y="171" text-anchor="middle">2</text>
+        <text class="st" x="370" y="164">vkCreateShaderModule hook</text><text class="st2" x="370" y="178">SPIR-V repaired below vkd3d's cache</text>
+        <circle class="tapc" cx="640" cy="167" r="10"/><text class="tapt" x="640" y="171" text-anchor="middle">3</text>
+        <text class="st" x="658" y="164">dxgi.dll shim</text><text class="st2" x="658" y="178">swapchain E_NOTIMPL</text>
+        <rect x="100" y="196" width="700" height="16" fill="none"/>
+        <text class="st2" x="100" y="208">RealD3D12 = vkd3d\d3d12.dll  ←  the chain is declared in one ini line, not hard-coded</text>
+
+        <path class="fl" d="M450 224 L450 256" marker-end="url(#ar)"/>
+        <text class="lbl" x="462" y="245">forwarded D3D12 API</text>
+
+        <!-- vkd3d -->
+        <rect class="bx-o" x="80" y="258" width="740" height="130" rx="2"/>
+        <text class="t" x="100" y="284">vkd3d-proton 3.0.1 <tspan class="st">— patched, 9 files, +869 / −13</tspan></text>
+        <text class="st" x="100" y="303">LGPL-2.1-or-later · modified source ships with this package</text>
+        <circle class="tapc" cx="112" cy="331" r="10"/><text class="tapt" x="112" y="335" text-anchor="middle">4</text>
+        <text class="st" x="130" y="328">ExecuteIndirect fallback</text><text class="st2" x="130" y="342">command.c +557 — no DGC needed</text>
+        <circle class="tapc" cx="392" cy="331" r="10"/><text class="tapt" x="392" y="335" text-anchor="middle">5</text>
+        <text class="st" x="410" y="328">Root-constant unroll</text><text class="st2" x="410" y="342">meta.c +51 · push-UBO mode</text>
+        <circle class="tapc" cx="640" cy="331" r="10"/><text class="tapt" x="640" y="335" text-anchor="middle">6</text>
+        <text class="st" x="658" y="328">PSO / cache paths</text><text class="st2" x="658" y="342">state.c +131 · cache.c +29</text>
+
+        <path class="fl" d="M300 388 L300 420" marker-end="url(#ar)"/>
+        <text class="lbl" x="312" y="409">DXIL</text>
+        <path class="fl" d="M640 388 L640 420" marker-end="url(#ar)"/>
+        <text class="lbl" x="652" y="409">VkPipeline / VkCmd*</text>
+
+        <!-- dxil-spirv + post pass -->
+        <rect class="bx" x="80" y="422" width="420" height="94" rx="2"/>
+        <text class="t" x="100" y="447">dxil-spirv</text>
+        <text class="st" x="100" y="465">pinned 62dbb07f · MIT · runtime-identical to upstream</text>
+        <circle class="tapc" cx="112" cy="493" r="10"/><text class="tapt" x="112" y="497" text-anchor="middle">7</text>
+        <text class="st" x="130" y="490">SPIR-V post-pass  <tspan class="st2">(in the shim, tap 2)</tspan></text>
+        <text class="st2" x="130" y="504">helper-invocation collapse · strip dead VRS cap · fp16 demote</text>
+
+        <rect class="bx-s" x="516" y="422" width="304" height="94" rx="2"/>
+        <text class="t" x="536" y="447">amdvlk64 — stock</text>
+        <text class="st" x="536" y="465">unmodified AMD Vulkan driver</text>
+        <circle class="tapc" cx="548" cy="493" r="10"/><text class="tapt" x="548" y="497" text-anchor="middle">8</text>
+        <text class="st" x="566" y="490">DxcCache guard</text><text class="st2" x="566" y="504">launch-time, outside the process</text>
+
+        <path class="fl" d="M290 516 L290 548" marker-end="url(#ar)"/>
+        <path class="fl" d="M610 516 L610 548" marker-end="url(#ar)"/>
+
+        <!-- silicon -->
+        <rect class="bx-s" x="150" y="550" width="600" height="48" rx="2"/>
+        <text class="t" x="170" y="574">Polaris 20 silicon</text>
+        <text class="st" x="170" y="590">36 CUs · wave64 · 8 GB GDDR5 · no VRS, no DGC, no native fp16</text>
+      </svg>
+    </div>
+
+    <div class="taps">
+      <div class="tap"><b>1</b><span>Answer the gate<i>Feature level, fp16, subgroup range. Every forged answer creates a downstream bill.</i></span></div>
+      <div class="tap"><b>2</b><span>Repair SPIR-V under the cache<i>Hooking <code>vkCreateShaderModule</code> instead of using <code>VKD3D_SHADER_OVERRIDE</code> keeps pipeline caching alive. That distinction is what made a swapchain reachable at all.</i></span></div>
+      <div class="tap"><b>3</b><span>Satisfy the swapchain<i>A separate <code>dxgi.dll</code> answering what the real one returned <code>E_NOTIMPL</code> for.</i></span></div>
+      <div class="tap"><b>4</b><span>Draw indirect without DGC<i>vkd3d returned early when a command signature carried root arguments. 5,281 of 5,284 signatures did.</i></span></div>
+      <div class="tap"><b>5</b><span>Per-command root constants<i>Force push-UBO mode, then unroll the argument buffer in a compute pass.</i></span></div>
+      <div class="tap"><b>6</b><span>Keep PSOs alive<i>Pipeline-state and cache paths, plus the flag accounting that made success counts mean something.</i></span></div>
+      <div class="tap"><b>7</b><span>Make the module legal<i>Three transforms, all in the shim's hook: collapse helper-invocation loads, strip a dead VRS capability, demote fp16.</i></span></div>
+      <div class="tap"><b>8</b><span>Keep commit under the limit<i>The one intervention deliberately kept <em>outside</em> the process, where it cannot break a working binary.</i></span></div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ======================================================================
+     §3 FAULTS
+     ====================================================================== -->
+<section>
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="sec-no">§ 3</span>
+      <div>
+        <h2>Twelve faults</h2>
+        <p class="lede">Each one is stated with the measurement that closed it. The number in the margin is the delta on a real launch of the real game — not a synthetic test.</p>
+      </div>
+    </div>
+
+    <div class="faults">
+
+      <article class="fault rv">
+        <div class="fault-top">
+          <span class="fault-id">FAULT 01 · descriptors</span>
+          <span class="delta fix">graphics pipeline failures → 0</span>
+        </div>
+        <h3>Polaris cannot compile a graphics pipeline that uses a mutable descriptor type</h3>
+        <p>vkd3d-proton reaches for <code>VK_EXT_mutable_descriptor_type</code> because it collapses descriptor-heap emulation into one binding. amdvlk64 advertises it. On Polaris the compiler then fails every graphics pipeline that touches it, and D3D12 surfaces that as an opaque <code>VK_ERROR_UNKNOWN</code>.</p>
+        <p>Disabling both the <code>EXT</code> and <code>VALVE</code> forms took graphics-pipeline creation failures to zero in the live game. This was the first fault found and the one that made every later measurement possible — until it was gone, every log was dominated by it.</p>
+        <p class="where">Where: device extension filter in the shim.</p>
+      </article>
+
+      <article class="fault rv">
+        <div class="fault-top">
+          <span class="fault-id">FAULT 02 · shader compiler</span>
+          <span class="delta fix">11 of 11 crashers fixed · 0 regressions across 402 modules</span>
+        </div>
+        <h3>A <code>gl_HelperInvocation</code> load storm faults the driver's use-list walk</h3>
+        <p>Some fragment shaders load the <code>HelperInvocation</code> builtin more than a hundred times. Polaris' shader compiler walks the use-list of that value and either takes an access violation that gets swallowed, or never returns at all — the same defect wearing two faces, which is why it read as two unrelated bugs for a day.</p>
+        <p>The fix is one line of intent: load the builtin once, reuse the result. Collapsing the loads to a single value fixed all eleven known crashers with zero regressions measured over 402 modules.</p>
+        <p>Getting there required abandoning hypothesis-driven debugging entirely. Every hand-picked theory about those shaders was refuted; the shader's <em>declarations</em> were innocent and its <em>code</em> was guilty. Delta-debugging the module found it in minutes after hours of reasoning had not.</p>
+        <p class="where">Where: SPIR-V post-pass, <code>vkCreateShaderModule</code> hook.</p>
+      </article>
+
+      <article class="fault rv">
+        <div class="fault-top">
+          <span class="fault-id">FAULT 03 · shader compiler</span>
+          <span class="delta neu">second encoding · opcode 5381</span>
+        </div>
+        <h3>The same builtin has a second form, and rewriting it grows the module</h3>
+        <p><code>OpIsHelperInvocationEXT</code> (opcode 5381) is the other way that value reaches the compiler. Handling it is not symmetric with fault 02: the rewrite needs spare space in the binary, the SPIR-V header length written back afterwards, and an anchor value that resets whenever a demote happens or a call that can reach a demote is made.</p>
+        <p>A CFG-aware version of that anchor collapse was designed, measured, and <strong>deliberately not written</strong>: it gained between 0% and 68% depending on the shader, the worst-case shader stayed above the fault threshold anyway, and the demote-dominance const-true rule gained exactly nothing. Measuring a refactor before writing it is cheaper than writing it.</p>
+        <p class="where">Where: SPIR-V post-pass.</p>
+      </article>
+
+      <article class="fault rv">
+        <div class="fault-top">
+          <span class="fault-id">FAULT 04 · pipeline creation</span>
+          <span class="delta fix">refusals 9 → 0 · VkResult −3: 51 → 0 · E_OUTOFMEMORY 16 → 0</span>
+        </div>
+        <h3>A dead <code>FragmentShadingRateKHR</code> declaration was refusing pipelines</h3>
+        <p>Shaders declared variable-rate-shading capability on a card that has no VRS. The capability was never used — the declaration alone was enough for the driver to refuse the pipeline with <code>VkResult = -3</code>, which vkd3d then relabelled as <code>E_OUTOFMEMORY</code> at <code>state.c:5728</code>. That mistranslation sent the investigation after memory pressure for hours. The box did have only 0.3&nbsp;GB free — true, and irrelevant.</p>
+        <p>Stripping the unused declaration took all three counters to zero on the same launch.</p>
+        <div class="note warn" style="margin:1.2em 0 0">
+          <p class="small" style="margin:0"><strong>Four hypotheses died here first:</strong> the pipeline layout was <em>not</em> the discriminator (the failing layout was the same object graph as a passing one, and swapping them changed nothing). It was not helper-invocation related (a module collapsed to fanout 27 and accepted by <code>vkCreateShaderModule</code> was still refused, and three of the modules were helper-op-free vertex shaders). It survived dropping the fragment stage entirely. And it was not memory — peak commit 5.6&nbsp;GB against a 16.4&nbsp;GB limit.</p>
+        </div>
+        <p class="where">Where: SPIR-V post-pass.</p>
+      </article>
+
+      <article class="fault rv">
+        <div class="fault-top">
+          <span class="fault-id">FAULT 05 · subgroups</span>
+          <span class="delta fix">validation admits WaveSize(32)</span>
+        </div>
+        <h3><code>[WaveSize(32)]</code> on a wave64 card</h3>
+        <p>Shaders annotated <code>[WaveSize(32)]</code> are rejected outright: GCN4 is wave64 and the driver reports a fixed subgroup size of 64. Vulkan validation only requires <code>min ≤ 32 ≤ max</code>, so forging <code>minSubgroupSize</code> down to 16 satisfies it without lying about anything the shader can observe.</p>
+        <div class="note warn" style="margin:1.2em 0 0">
+          <h4 style="color:var(--oxide)">The trap in this fix</h4>
+          <p class="small" style="margin:0">vkd3d-proton branches on the executable name <code>CrimsonDesert.exe</code> to apply an RDNA1 compatibility profile — and that branch is gated on <code>minSubgroupSize == 32</code>. So 32 is a uniquely dangerous value to forge here: it silently activates a profile written for different hardware. 16 is correct precisely because it is not 32.</p>
+        </div>
+        <p class="where">Where: capability forge. Each mode change costs one cold-cache launch to evaluate.</p>
+      </article>
+
+      <article class="fault rv">
+        <div class="fault-top">
+          <span class="fault-id">FAULT 06 · fp16</span>
+          <span class="delta no">337 fragment modules made invalid</span>
+        </div>
+        <h3>The fp16 graphics demote emitted invalid SPIR-V</h3>
+        <p>Having forged native fp16 support, the fp16 arithmetic then has to go somewhere. The graphics demote path rewrote <code>%v2half</code> to <code>%v2float</code> <em>inside a bitcast</em>, producing an <code>OpBitcast</code> between mismatched widths. 337 fragment modules became invalid SPIR-V. Compute shaders kept fp16 untouched and had zero failures — the split was perfectly clean along the Fragment boundary, which is what identified it.</p>
+        <p>Worth recording that fp16 was <strong>also ruled out</strong> as the cause of an earlier failure, twice: fp16 arithmetic and fp16 attachment formats were both validly eliminated. The fp16-versus-int16 distinction mattered, and this build compiles out <code>WARN</code> and <code>TRACE</code>, which is why that took as long as it did.</p>
+        <p class="where">Where: SPIR-V post-pass. Currently disabled — <code>DXIL_SPIRV_GRAPHICS_DISABLE_NATIVE_FP16 = 0</code>.</p>
+      </article>
+
+      <article class="fault rv">
+        <div class="fault-top">
+          <span class="fault-id">FAULT 07 · command stream</span>
+          <span class="delta fix">indirect draws 14 → 255 per frame</span>
+        </div>
+        <h3>Missing DGC silently discarded most indirect draws</h3>
+        <p>This is the fault that was hiding the world. vkd3d's <code>ExecuteIndirect</code> path returns early when a command signature carries root arguments and device-generated commands are unavailable. It returns <em>without drawing and without complaining</em>. Of 5,284 command signatures the engine created, <strong>5,281 carried root arguments</strong>.</p>
+        <p>Falling through to a manual path at <code>command.c:17159</code> took indirect draws from 14 to 255 per frame. This engine is GPU-driven: its real batches carry roughly 53 draws each, and an earlier reading of <code>maxDrawCount = 1</code> was survivorship bias — the batches that reached the log were the trivial ones.</p>
+        <p class="where">Where: vkd3d-proton <code>libs/vkd3d/command.c</code>, +557 / −4.</p>
+      </article>
+
+      <article class="fault rv">
+        <div class="fault-top">
+          <span class="fault-id">FAULT 08 · command stream</span>
+          <span class="delta fix">450,000 calls handled · 0 rejected · 0 refusals</span>
+        </div>
+        <h3>Per-command root constants, emulated without DGC</h3>
+        <p>Fault 07's fallback then needs each unrolled command to see its own root constants. Two changes: force push-UBO mode, and unroll the argument buffer in a compute pass. 450,000 calls were handled with none rejected and no pipeline refusals introduced.</p>
+        <div class="note warn" style="margin:1.2em 0 0">
+          <p class="small" style="margin:0"><strong>The PSO cache cannot detect this.</strong> Changing the root-argument interface changes shader behaviour without changing anything the pipeline cache hashes. A stale cache will serve pipelines built for the old interface. The cache has to be moved aside by hand when this lands — a silent-wrong-answer failure mode, not a crash.</p>
+        </div>
+        <p class="where">Where: vkd3d-proton <code>meta.c</code> +51, <code>vkd3d_private.h</code> +56.</p>
+      </article>
+
+      <article class="fault rv">
+        <div class="fault-top">
+          <span class="fault-id">FAULT 09 · host memory</span>
+          <span class="delta fix">peak commit 30,916 → 8,768 MiB</span>
+        </div>
+        <h3>The endless "Compiling Shaders" screen was a 4&nbsp;GB AMD DxcCache</h3>
+        <p>The single most user-visible fault, and it was not in any code. AMD's shader cache at <code>%LOCALAPPDATA%\AMD\DxcCache</code> had grown to 4.0&nbsp;GB. The game then committed 30,916&nbsp;MB against a 32,318&nbsp;MB Windows commit limit — 805&nbsp;MB of headroom. The compile worker died silently and the game sat on its compile screen forever, at 82 fps, showing a black frame.</p>
+        <p>The tell was <strong>equal working set with 2.7× the commit</strong>. That signature is memory that is reserved but never touched, which points at a mapped file, not at leaked allocations. Emptying the cache dropped peak commit to 8,768&nbsp;MiB and the game reached gameplay.</p>
+        <p>Three other explanations for the same screen were measured and refuted first: the DGC unroll bound, bad shaders, and shader-compile concurrency.</p>
+        <p class="where">Where: outside the process entirely. Now guarded at launch by <code>Play Crimson Desert (RX 580).cmd</code>, which never touches <code>DxCache</code> — no second 'c' — because the Radeon service holds that one open.</p>
+      </article>
+
+      <article class="fault rv">
+        <div class="fault-top">
+          <span class="fault-id">FAULT 10 · process</span>
+          <span class="delta fix">refusals 41 → 0 on revert</span>
+        </div>
+        <h3>A shim build I had made myself was the regression</h3>
+        <p>A compile-screen failure that looked like a game bug was a binary I had built thirteen minutes earlier. Restoring the previous build took refusals from 41 to zero and reached the menu. The cause was building by hand instead of with <code>build_shim.py</code> — the script strips the binary and a hand-rolled <code>g++</code> line does not. The one time that was done, launch success went from 12/12 to 2/12.</p>
+        <p>The lasting change is procedural, and it is the most valuable single line in this report:</p>
+        <div class="note warn" style="margin:1.2em 0 0">
+          <p style="margin:0"><strong>Hash every file you wrote against its backup before calling a revert complete.</strong> A revert that checked three files out of four cost a working build and an evening. Checking three of four is not a revert; it is a coin toss with extra steps.</p>
+        </div>
+        <p class="where">Where: build procedure. <code>backup-previous\d3d12.dll</code> is the instant escape hatch.</p>
+      </article>
+
+      <article class="fault rv">
+        <div class="fault-top">
+          <span class="fault-id">FAULT 11 · capability</span>
+          <span class="delta neu">reporting gap closed</span>
+        </div>
+        <h3><code>shaderFloat16</code> reporting, and the denorm modes underneath it</h3>
+        <p>Forging fp16 support is not one boolean. The reported capability, the <code>DenormPreserve</code> / <code>DenormFlushToZero</code> execution modes, and what the shader actually does with a half have to agree, or validation rejects the module while the capability query says everything is fine. Three distinct modes were implemented and each has a different failure surface.</p>
+        <p class="where">Where: capability forge; <code>vkd3d_shaders.h</code>, <code>include/vkd3d_shader.h</code>.</p>
+      </article>
+
+      <article class="fault rv">
+        <div class="fault-top">
+          <span class="fault-id">FAULT 12 · presentation</span>
+          <span class="delta fix">swapchain reached</span>
+        </div>
+        <h3>The DXGI swapchain returned <code>E_NOTIMPL</code></h3>
+        <p>All the shader work in the world is invisible without a surface to present to. A companion <code>dxgi.dll</code> (1,272 lines) answers the swapchain creation path that was returning <code>E_NOTIMPL</code>. Combined with fault 02's change of substitution strategy — hooking below vkd3d's cache rather than through its override, which forces <code>pipeline_library_ignore_spirv</code> and kills caching — this produced the first swapchain the project ever reached.</p>
+        <p class="where">Where: <code>src/dxgishim</code>, 6 files.</p>
+      </article>
+
+    </div>
+
+    <h3>What it looks like now</h3>
+    <div class="figs">
+      <figure>
+        <img src="paper/figures/after-gameplay-day.jpg" alt="Daylight gameplay: terrain, foliage, buildings, character, all textured and lit.">
+        <figcaption>Daylight. Terrain, foliage, buildings and character all present. 0% magenta and 0% flat-grey across four sampled frames — no missing or untextured surfaces.</figcaption>
+      </figure>
+      <figure>
+        <img src="paper/figures/after-gameplay-night.jpg" alt="Night gameplay with local light sources and shadowing.">
+        <figcaption>Night. Local lights and shadowing intact. Zero texture formats rejected or substituted in either log.</figcaption>
+      </figure>
+      <figure>
+        <img src="paper/figures/loading-transition.jpg" alt="A loading transition screen rendering correctly.">
+        <figcaption>Loading transition — reached, rendered, and passed through, which for most of this project's life it was not.</figcaption>
+      </figure>
+      <figure>
+        <img src="paper/figures/before-black.jpg" alt="An almost entirely black frame, average luminance near zero.">
+        <figcaption>The state every archived run began in: black from frame 0, average luminance 0.0–0.1.</figcaption>
+      </figure>
+    </div>
+  </div>
+</section>
+
+
+<!-- ======================================================================
+     §4 THE LEDGER — signature element
+     ====================================================================== -->
+<section>
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="sec-no">§ 4</span>
+      <div>
+        <h2>The hypothesis ledger</h2>
+        <p class="lede">Twelve confirmed against forty-eight refuted. The refuted column is the more useful one, and it is the part that normally never gets written down. Every entry carries the measurement that decided it — a hypothesis without a deciding measurement is not on this page at all.</p>
+      </div>
+    </div>
+
+    <div class="ledger rv">
+      <div class="ledger-head"><span>Confirmed — 12</span><span>Refuted — 48 total, 12 shown</span></div>
+      <div class="ledger-body">
+        <div class="ledger-col">
+          <div class="lrow win"><span class="k">01</span><span class="t">Mutable descriptor type breaks graphics pipelines<span class="m">Disabled EXT + VALVE forms → failures 0</span></span></div>
+          <div class="lrow win"><span class="k">02</span><span class="t">gl_HelperInvocation load storm<span class="m">Collapse to one load → 11/11 fixed, 0 regressions / 402 modules</span></span></div>
+          <div class="lrow win"><span class="k">03</span><span class="t">OpIsHelperInvocationEXT is a second form<span class="m">Opcode 5381 needs slack + length write-back + anchor reset</span></span></div>
+          <div class="lrow win"><span class="k">04</span><span class="t">Dead FragmentShadingRateKHR declaration<span class="m">Strip unused cap → −3: 51→0, E_OUTOFMEMORY 16→0</span></span></div>
+          <div class="lrow win"><span class="k">05</span><span class="t">WaveSize(32) needs a forged subgroup minimum<span class="m">minSubgroupSize 16 satisfies min ≤ 32 ≤ max</span></span></div>
+          <div class="lrow win"><span class="k">06</span><span class="t">fp16 graphics demote emits invalid OpBitcast<span class="m">337 modules, all Fragment; compute kept fp16, 0 failures</span></span></div>
+          <div class="lrow win"><span class="k">07</span><span class="t">Missing DGC silently drops indirect draws<span class="m">5,281 / 5,284 signatures carry root args → 14 to 255 draws</span></span></div>
+          <div class="lrow win"><span class="k">08</span><span class="t">Root constants can be unrolled in compute<span class="m">450k calls, 0 rejected, 0 refusals</span></span></div>
+          <div class="lrow win"><span class="k">09</span><span class="t">A 4 GB DxcCache is a commit-limit wall<span class="m">Peak commit 30,916 → 8,768 MiB</span></span></div>
+          <div class="lrow win"><span class="k">10</span><span class="t">The 13:41 shim build was the regression<span class="m">Restore 13:09 build → refusals 41→0, menu reached</span></span></div>
+          <div class="lrow win"><span class="k">11</span><span class="t">shaderFloat16 needs the denorm modes to agree<span class="m">Three modes, three distinct failure surfaces</span></span></div>
+          <div class="lrow win"><span class="k">12</span><span class="t">The swapchain path returned E_NOTIMPL<span class="m">dxgi.dll shim → first swapchain ever reached</span></span></div>
+        </div>
+        <div class="ledger-col">
+          <div class="lrow lose"><span class="k">×</span><span class="t">fp16 is the blocker<span class="m">Arithmetic and attachment formats both validly eliminated</span></span></div>
+          <div class="lrow lose"><span class="k">×</span><span class="t">The pipeline layout is the refusal discriminator<span class="m">Failing layout = same object graph as a passing one; swap changed nothing</span></span></div>
+          <div class="lrow lose"><span class="k">×</span><span class="t">The refusals are a helper-invocation problem<span class="m">Fanout-27 module accepted by vkCreateShaderModule still refused; 3 offenders were helper-op-free vertex shaders</span></span></div>
+          <div class="lrow lose"><span class="k">×</span><span class="t">Memory pressure is the blocker<span class="m">Peak commit 5.6 GB against a 16.4 GB limit</span></span></div>
+          <div class="lrow lose"><span class="k">×</span><span class="t">E_OUTOFMEMORY means out of memory<span class="m">hr=0x8007000E is state.c:5728 relabelling a driver refusal</span></span></div>
+          <div class="lrow lose"><span class="k">×</span><span class="t">Failed PSOs are the missing geometry<span class="m">Refusals 5→0 left draw counts bit-identical across 54 windows</span></span></div>
+          <div class="lrow lose"><span class="k">×</span><span class="t">Depth-only PS stripping is a visibility bug<span class="m">None of them write UAVs or SV_Depth; size was a bad proxy</span></span></div>
+          <div class="lrow lose"><span class="k">×</span><span class="t">The failure is one bad pixel shader<span class="m">Five offenders in one launch, wearing two different faces</span></span></div>
+          <div class="lrow lose"><span class="k">×</span><span class="t">A CFG-aware anchor collapse is worth writing<span class="m">Measured 0–68% gain; worst shader stays above the fault floor</span></span></div>
+          <div class="lrow lose"><span class="k">×</span><span class="t">Stubbing the offending shaders is the fix<span class="m">11 stubs met 10 new offenders. Fix the class, not the instance</span></span></div>
+          <div class="lrow lose"><span class="k">×</span><span class="t">The black title screen is a video that fails to decode<span class="m">Zero movie assets, zero video DLLs, zero D3D12 Video interfaces requested</span></span></div>
+          <div class="lrow lose"><span class="k">×</span><span class="t">VKD3D_SHADER_CACHE_PSO_BLOB is the answer<span class="m">Landed, then reverted 13 minutes later: crashes amdvlk64, cut playable time 8×</span></span></div>
+        </div>
+      </div>
+      <div class="ledger-foot">36 further refutations are recorded in the project notes. The pattern that repeats: a hypothesis survives because the measurement that would kill it was never taken.</div>
+    </div>
+
+    <div class="narrow">
+      <h3>The measurement failed 44 times</h3>
+      <p>Refuting a hypothesis requires a measurement you can trust, and on this project measurements lied constantly and quietly. Forty-four distinct instances were recorded. Five representative ones:</p>
+      <ul>
+        <li><strong>Pipeline success counts are not evidence.</strong> A vkd3d flag makes it ask for pipelines it never compiles. 2,118 of 2,125 apparent "successes" compiled nothing at all. The number that means something is the count of a specific flag value, not the total.</li>
+        <li><strong>Anything that loads the shim truncates both logs.</strong> Config load opens them for truncate. One diagnostic ate the very launch it was diagnosing. Archive before every run.</li>
+        <li><strong>A probe that reports <code>n/a</code> is not a negative result.</strong> One probe reported <code>n/a</code> for twelve consecutive runs, so the condition it existed to test was never actually tested once.</li>
+        <li><strong>A swap probe is only evidence if the substitute is interface-compatible.</strong> Otherwise "swapping them changed nothing" means the swap did not happen.</li>
+        <li><strong>The shell lies about paths.</strong> Git Bash eats <code>/F</code> as a path, <code>awk -F:</code> splits on the drive letter, <code>tar</code> reads <code>D:</code> as a remote hostname. An early marker count returned 0 for everything because of a colon.</li>
+      </ul>
+      <p>A patch that used raw <code>getenv</code> in the wrong place turned an entire capture session into a no-op. The user reported "can't see much change than before" — a correct observation of a measurement that had silently stopped measuring. Believing the person at the keyboard over your own instrumentation was, repeatedly, the right call.</p>
+    </div>
+  </div>
+</section>
+
+
+<!-- ======================================================================
+     §5 COST
+     ====================================================================== -->
+<section>
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="sec-no">§ 5</span>
+      <div>
+        <h2>What it cost</h2>
+        <p class="lede">Line counts are exact — counted from the tree that produced the shipped binaries. The experience figure is an estimate, and labelled as one.</p>
+      </div>
+    </div>
+
+    <div class="stats rv">
+      <div class="stat"><b>25,304</b><span>lines authored, total</span></div>
+      <div class="stat"><b>112</b><span>source files</span></div>
+      <div class="stat"><b>13</b><span>upstream files patched</span></div>
+      <div class="stat"><b>7</b><span>days elapsed<br>11–18 Aug 2026</span></div>
+    </div>
+
+    <div class="scroll">
+      <table class="tbl">
+        <thead><tr><th>Component</th><th class="n">Lines</th><th class="n">Files</th><th>What it is</th></tr></thead>
+        <tbody>
+          <tr><td><code>src/shim</code></td><td class="n">9,769</td><td class="n">32</td><td>The <code>d3d12.dll</code> the game loads: capability forge, Vulkan hooks, SPIR-V post-pass</td></tr>
+          <tr><td><code>tools</code></td><td class="n">11,706</td><td class="n">61</td><td>Build, launch-capture, log analysis, SPIR-V reduction, frame sampling</td></tr>
+          <tr><td><code>src/dxgishim</code></td><td class="n">1,272</td><td class="n">6</td><td>The companion <code>dxgi.dll</code> — swapchain and adapter</td></tr>
+          <tr><td><code>dx12bridge.ini</code></td><td class="n">997</td><td class="n">1</td><td>Every lever, documented inline, no recompile needed to change one</td></tr>
+          <tr><td><code>src/probe</code></td><td class="n">464</td><td class="n">2</td><td>Standalone capability probe</td></tr>
+          <tr><td>vkd3d-proton patch</td><td class="n">+869 / −13</td><td class="n">9</td><td>ExecuteIndirect fallback, root-constant unroll, PSO and cache paths</td></tr>
+          <tr><td>dxil-spirv patch</td><td class="n">+227 / −8</td><td class="n">4</td><td>fp16 handling. <strong>Inert at runtime</strong> — the levers are off, so it behaves as pristine upstream</td></tr>
+        </tbody>
+        <tfoot><tr><td>Total authored</td><td class="n">25,304</td><td class="n">115</td><td>23,211 own source + 997 ini + 1,096 patch lines</td></tr></tfoot>
+      </table>
+    </div>
+
+    <h3>Where the vkd3d-proton changes landed</h3>
+    <div class="scroll">
+      <table class="tbl">
+        <thead><tr><th>File</th><th class="n">Added</th><th class="n">Removed</th><th>Why</th></tr></thead>
+        <tbody>
+          <tr><td><code>libs/vkd3d/command.c</code></td><td class="n">557</td><td class="n">4</td><td>ExecuteIndirect fallback — fault 07</td></tr>
+          <tr><td><code>libs/vkd3d/state.c</code></td><td class="n">131</td><td class="n">3</td><td>Pipeline state, refusal reporting</td></tr>
+          <tr><td><code>libs/vkd3d/vkd3d_private.h</code></td><td class="n">56</td><td class="n">0</td><td>Structures for the unroll path</td></tr>
+          <tr><td><code>libs/vkd3d/meta.c</code></td><td class="n">51</td><td class="n">0</td><td>The compute unroll pass — fault 08</td></tr>
+          <tr><td><code>libs/vkd3d/cache.c</code></td><td class="n">29</td><td class="n">1</td><td>Pipeline cache behaviour</td></tr>
+          <tr><td><code>libs/vkd3d/device.c</code></td><td class="n">29</td><td class="n">4</td><td>Extension and feature plumbing</td></tr>
+          <tr><td><code>include/vkd3d_shader.h</code></td><td class="n">9</td><td class="n">0</td><td>fp16 mode surface</td></tr>
+          <tr><td><code>libs/vkd3d-shader/vkd3d_shader_main.c</code></td><td class="n">6</td><td class="n">1</td><td>Mode plumbing</td></tr>
+          <tr><td><code>libs/vkd3d/vkd3d_shaders.h</code></td><td class="n">1</td><td class="n">0</td><td>One declaration</td></tr>
+        </tbody>
+        <tfoot><tr><td>9 files</td><td class="n">869</td><td class="n">13</td><td>Verified: the shipped patch reproduces all nine byte-for-byte from clean upstream v3.0.1</td></tr></tfoot>
+      </table>
+    </div>
+
+    <h3>How much experience this needs</h3>
+    <p class="narrow">This is the part of the question that cannot be measured, so here are two honest numbers instead of one confident one.</p>
+    <div class="stats rv">
+      <div class="stat"><b>6–10</b><span>engineer-<strong>months</strong> of focused effort to do this work</span></div>
+      <div class="stat"><b>8–12</b><span>engineer-<strong>years</strong> of prior graphics and driver specialisation it rests on</span></div>
+      <div class="stat"><b>7</b><span>days it actually took, elapsed</span></div>
+    </div>
+    <div class="narrow">
+      <p>The second number is the real cost and it is not visible in any diff. Nothing in §3 is reachable without already knowing how SPIR-V is laid out in binary, why a use-list walk in a shader compiler is a plausible thing to fault, what <code>VkResult = -3</code> means before you look it up, that <code>ExecuteIndirect</code> maps onto device-generated commands, and that equal working set with 2.7× the commit means a mapped file. That is graphics-driver knowledge accumulated over years, and every one of the twelve faults consumed some of it.</p>
+      <p>The first number is what the doing took: twelve faults, forty-eight refutations, and forty-four occasions when the instrumentation had to be repaired before the experiment could run. The seven-day figure is real but it is not a claim about difficulty — it is what happens when the compile-test-measure loop runs continuously and someone is at the keyboard to launch the game every time.</p>
+    </div>
+  </div>
+</section>
+
+
+<!-- ======================================================================
+     §6 STILL BROKEN
+     ====================================================================== -->
+<section>
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="sec-no">§ 6</span>
+      <div>
+        <h2>What still does not work</h2>
+        <p class="lede">Three known defects, stated plainly. Two of them are diagnosed and deliberately not fixed, because the build finally works and the risk is not worth it.</p>
+      </div>
+    </div>
+
+    <div class="faults">
+      <article class="fault">
+        <div class="fault-top">
+          <span class="fault-id">OPEN 01 · diagnosed, not fixed</span>
+          <span class="delta no">background never submitted</span>
+        </div>
+        <h3>The title-screen background is black</h3>
+        <p>The text and UI render. The scene behind them does not. This is not a render failure and not a broken video: there are <strong>zero movie assets</strong> of any format in the install, no Bink or Media Foundation DLLs in <code>bin64</code>, zero D3D12 Video interfaces requested, and zero <code>E_NOINTERFACE</code>.</p>
+        <p>The command stream settles it. Across all 100 measured black windows the workload is flat and UI-shaped: <code>draw=360 drawIndexed=4200 indirect=12120 dispatch=35020</code> per 120 frames — about 3 direct and 30 indexed draws per frame. Once the game is actually lit, indirect draws step to roughly 192,000 per frame. There is <strong>no step anywhere inside the black stretch</strong>. The compile screen and the title screen submit the same near-empty workload, so the background scene is never handed to the GPU at all.</p>
+        <p>Suggestive but unproven: about 101 <code>ExecuteIndirect</code> calls per frame fed by about 292 compute dispatches is this engine's GPU-driven culling path, and a background submitted that way goes black if the argument-generating compute yields zero counts. Chasing that means touching the indirect path that fault 07 just fixed. Not worth it.</p>
+      </article>
+
+      <article class="fault">
+        <div class="fault-top">
+          <span class="fault-id">OPEN 02 · load-bearing workaround</span>
+          <span class="delta no">turning it off → 36 refusals, death</span>
+        </div>
+        <h3>Depth-only pixel-shader stripping cannot be turned off</h3>
+        <p>The shim deletes pixel shaders from depth-only pipelines. That workaround is holding the build up: disabling it produces 36 pipeline refusals and the game dies. The shaders it deletes are <em>exactly</em> the ones Polaris refuses, which makes fixing them properly the path to whatever foliage is still missing — and also the reason the workaround exists.</p>
+        <p>It was checked for correctness: none of the stripped shaders write UAVs or <code>SV_Depth</code>. The only side effect at risk is an undetectable <code>discard</code>, which is why the current mode is the conservative one.</p>
+      </article>
+
+      <article class="fault">
+        <div class="fault-top">
+          <span class="fault-id">OPEN 03 · environmental</span>
+          <span class="delta no">3,103 MB available at peak</span>
+        </div>
+        <h3>Commit headroom is thin on 8&nbsp;GB</h3>
+        <p>Mid-gameplay peak commit is 11,773&nbsp;MiB with about 3,103&nbsp;MB still available. That works, but it is not comfortable, and <code>DxcCache</code> regrows on every launch — so fault 09's wall can come back. The launcher script guards against it. More RAM buys load speed and a usable debug loop; it does not fix anything in this report, and that was measured, not assumed.</p>
+      </article>
+    </div>
+
+    <p class="narrow small">Foliage smearing during motion was investigated and is attributed to frame rate rather than to a rendering defect. It is not in this list.</p>
+  </div>
+</section>
+
+
+<!-- ======================================================================
+     §7 INSTALL
+     ====================================================================== -->
+<section id="install">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="sec-no">§ 7</span>
+      <div>
+        <h2>Installing it</h2>
+        <p class="lede">Five files into one folder. Nothing is written to your system, nothing is registered, and reverting is deleting what you copied.</p>
+      </div>
+    </div>
+
+    <div class="narrow">
+      <div class="note">
+        <p style="margin:0"><strong>Before anything else, back up the folder you are about to copy into.</strong> If a file with the same name already exists there, keep the original — that is your revert. This report contains an entire section (fault 10) about what happens when a revert is incomplete.</p>
+      </div>
+
+      <ol class="steps">
+        <li>
+          <h4>Check you are on the right hardware</h4>
+          <p>This targets AMD Polaris — RX 470/480/570/580/590, including the 2048SP. On RDNA or newer you do not need it, and it will make things worse. It has been tested on exactly one machine.</p>
+        </li>
+        <li>
+          <h4>Find your game folder</h4>
+          <p>The folder that contains <code>CrimsonDesert.exe</code>, usually <code>...\Crimson Desert\bin64\</code>.</p>
+        </li>
+        <li>
+          <h4>Copy the contents of <code>fix\</code> into it</h4>
+          <p>That is <code>d3d12.dll</code>, <code>dxgi.dll</code>, <code>dx12bridge.ini</code>, and the <code>vkd3d\</code> subfolder with two DLLs inside it. Keep the <code>vkd3d\</code> folder structure — <code>dx12bridge.ini</code> line 35 points at <code>vkd3d\d3d12.dll</code> and the chain breaks if it moves.</p>
+        </li>
+        <li>
+          <h4>Empty your AMD shader cache once</h4>
+          <p>Delete the contents of <code>%LOCALAPPDATA%\AMD\DxcCache</code>. Not the folder — what is inside it. This is fault 09 and it is the difference between reaching the game and staring at "Compiling Shaders" forever. Never touch <code>DxCache</code> without the second 'c'; the Radeon service holds it open.</p>
+        </li>
+        <li>
+          <h4>Launch with <code>Play Crimson Desert (RX 580).cmd</code></h4>
+          <p>Optional but recommended. It checks the two cache folders before every launch, empties them only if they are over budget, prints your commit headroom, and then starts the game. It is a plain text file — open it and read it before you run it. You can also just start the game normally.</p>
+        </li>
+        <li>
+          <h4>Expect the first launch to be slow</h4>
+          <p>Every shader compiles from scratch. Subsequent launches are much faster. If it hangs on "Compiling Shaders" for more than about twenty minutes, empty <code>DxcCache</code> again and check how much commit you have available.</p>
+        </li>
+      </ol>
+
+      <h3>Package contents</h3>
+      <div class="scroll">
+        <table class="tbl">
+          <thead><tr><th>Path</th><th class="n">Bytes</th><th>What</th></tr></thead>
+          <tbody>
+            <tr><td><code>fix/d3d12.dll</code></td><td class="n">3,601,660</td><td>The shim. This is the project.</td></tr>
+            <tr><td><code>fix/vkd3d/d3d12core.dll</code></td><td class="n">8,847,126</td><td>Patched vkd3d-proton core</td></tr>
+            <tr><td><code>fix/vkd3d/d3d12.dll</code></td><td class="n">267,221</td><td>vkd3d-proton loader</td></tr>
+            <tr><td><code>fix/dxgi.dll</code></td><td class="n">191,287</td><td>Swapchain shim — fault 12</td></tr>
+            <tr><td><code>fix/dx12bridge.ini</code></td><td class="n">56,376</td><td>997 lines of documented configuration</td></tr>
+            <tr><td><code>fix/Play Crimson Desert (RX 580).cmd</code></td><td class="n">12,050</td><td>Cache guard and launcher — fault 09</td></tr>
+            <tr><td><code>fix/licenses/</code></td><td class="n">—</td><td>LGPL-2.1 and MIT texts for the upstream projects</td></tr>
+            <tr><td><code>source/…-rx580-polaris.patch</code></td><td class="n">51,894</td><td>The vkd3d-proton modifications, as required by the LGPL</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="small">Every binary in this package is checksummed in <code>README.md</code>. Verify them before you copy anything into a game folder — including if you got this from anywhere other than the person who built it.</p>
+    </div>
+  </div>
+</section>
+
+
+<!-- ======================================================================
+     §8 CREDITS
+     ====================================================================== -->
+<section>
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="sec-no">§ 8</span>
+      <div>
+        <h2>Credits</h2>
+        <p class="lede">Almost none of the hard parts of this stack were written here. A shim is a small correction applied to an enormous amount of other people's work, and the proportions deserve to be stated accurately.</p>
+      </div>
+    </div>
+
+    <div class="narrow">
+      <div class="credit">
+        <b>Józef Kucia<em>1985–2020 · original author of vkd3d</em></b>
+        <p>Wrote the Direct3D-12-to-Vulkan translation layer that everything on this page is built on, and led it until his death. There is no version of this project that does not begin with his work.</p>
+      </div>
+      <div class="credit">
+        <b>Hans-Kristian Arntzen<em>vkd3d-proton · dxil-spirv</em></b>
+        <p>vkd3d-proton is the layer being patched here, and dxil-spirv — the DXIL-to-SPIR-V translator, MIT-licensed, "Copyright (c) 2019–2022 Hans-Kristian Arntzen for Valve Corporation" — is what turns the game's shaders into something a Vulkan driver will accept.</p>
+      </div>
+      <div class="credit">
+        <b>Philip Rebohle · Joshua Ashton<em>vkd3d-proton</em></b>
+        <p>Core maintainers of the project this fix modifies.</p>
+      </div>
+      <div class="credit">
+        <b>vkd3d-proton contributors<em>full list in fix/licenses/vkd3d-proton-AUTHORS.txt</em></b>
+        <p>Including Alexander Gabello, Alexandre Julliard and Andrew Eikum. The <code>AUTHORS</code> file ships in this package unedited.</p>
+      </div>
+      <div class="credit">
+        <b>Valve Corporation<em>sponsor</em></b>
+        <p>Funds the work that makes Direct3D 12 games run on Vulkan drivers at all.</p>
+      </div>
+      <div class="credit">
+        <b>Baldur Karlsson · The Khronos Group<em>vendored, MIT</em></b>
+        <p>bc-decoder and glslang, bundled inside dxil-spirv. Their notices ship with it.</p>
+      </div>
+      <div class="credit">
+        <b>SPIRV-Cross · SPIRV-Tools · SPIRV-Headers<em>byte-clean, unmodified</em></b>
+        <p>Used exactly as upstream ships them. Verified: not one byte differs.</p>
+      </div>
+      <div class="credit">
+        <b>AMD<em>amdvlk64, Radeon Software</em></b>
+        <p>The Vulkan driver underneath all of this is stock and unmodified. The palette of this document is borrowed from Radeon Software <em>Crimson</em> Edition, which is what this card's driver suite was called — an accident of naming too good to pass up.</p>
+      </div>
+      <div class="credit">
+        <b>Pearl Abyss<em>Crimson Desert</em></b>
+        <p>Whose game this is. No game file is modified, patched, or redistributed by this fix.</p>
+      </div>
+      <div class="credit">
+        <b>The person at the keyboard<em>every launch, every screenshot, every correction</em></b>
+        <p>Ran every one of the dozens of cold-cache launches this required, on the one machine that has the hardware, and reported back each time. Three interventions changed the direction of the work outright: <em>"the game is using 5.4&nbsp;GB of VRAM, it means things are loading, just not showing up"</em> — which reframed the whole problem from a load failure into a submission failure and led directly to fault 07; <em>"why are you disabling frame generation, it doesn't even relate to my problem"</em> — which stopped a wrong turn cold; and <em>"this is an in-game effect"</em> — correcting a frame I had mislabelled as a cutscene. Also <em>"stop testing, just launch and fix the game"</em>, which was the right instruction at the right moment.</p>
+      </div>
+
+      <h3>Licences</h3>
+      <p><strong>vkd3d-proton is LGPL-2.1-or-later.</strong> The <code>d3d12core.dll</code> in this package is a <em>modified</em> build, so sections 4 and 6 require that the corresponding modified source ship with it. It does: <code>source/vkd3d-proton-3.0.1-rx580-polaris.patch</code>, verified two ways — <code>patch -p1 --dry-run</code> exits clean against a fresh upstream v3.0.1 tree, and after applying it, all nine modified files reproduce byte-for-byte.</p>
+      <p><strong>dxil-spirv is MIT</strong>, pinned at <code>62dbb07f771534c8ce924479efdc6c8fa510361d</code>. Four files carry local changes (+227 / −8), all fp16-related, all inert at runtime because <code>dx12bridge.ini</code> line 371 sets <code>DXIL_SPIRV_GRAPHICS_DISABLE_NATIVE_FP16=0</code> and the other two levers are unset. Functionally, the shipped build behaves as pristine upstream.</p>
+      <p>Full licence texts are in <code>fix/licenses/</code>.</p>
+    </div>
+  </div>
+</section>
+
+
+<footer>
+  <div class="wrap">
+    <p><b>Crimson Desert on a Radeon RX 580 — engineering report.</b> 11–18 August 2026. One workstation, one card, seven days.</p>
+    <p>Twelve faults confirmed · forty-eight hypotheses refuted · forty-four measurements repaired · 25,304 lines authored · 13 upstream files patched.</p>
+    <p>Installation and checksums: <a href="README.md">README.md</a> &nbsp;·&nbsp; Modified vkd3d-proton source: <a href="source/vkd3d-proton-3.0.1-rx580-polaris.patch">source/</a> &nbsp;·&nbsp; Upstream: <a href="https://github.com/HansKristian-Work/vkd3d-proton">vkd3d-proton</a></p>
+    <p style="color:#5C636E">Not affiliated with AMD, Valve, or Pearl Abyss. No game files are redistributed. Nothing here is warranted to work on your machine; read fault 10 before you install it, and keep your backup.</p>
+  </div>
+</footer>
+
+<script>
+(function(){
+  /* --- drag-compare. One state variable; pointer drag on the stage and
+         arrow keys on the visible handle both drive it. --- */
+  var stage=document.getElementById('cmp'), grip=document.getElementById('grip');
+  if(stage&&grip){
+    var pos=52;
+    function set(v){
+      pos=Math.max(0,Math.min(100,v));
+      stage.style.setProperty('--seam',pos+'%');
+      grip.setAttribute('aria-valuenow',Math.round(pos));
+    }
+    function fromEvent(e){
+      var r=stage.getBoundingClientRect();
+      if(r.width) set(((e.clientX-r.left)/r.width)*100);
+    }
+    var dragging=false;
+    stage.addEventListener('pointerdown',function(e){
+      dragging=true;
+      try{stage.setPointerCapture(e.pointerId);}catch(err){}
+      fromEvent(e);
+      grip.focus({preventScroll:true});
+      e.preventDefault();
+    });
+    stage.addEventListener('pointermove',function(e){ if(dragging) fromEvent(e); });
+    stage.addEventListener('pointerup',function(){dragging=false;});
+    stage.addEventListener('pointercancel',function(){dragging=false;});
+    stage.addEventListener('lostpointercapture',function(){dragging=false;});
+    grip.addEventListener('keydown',function(e){
+      var step=e.shiftKey?10:2;
+      if(e.key==='ArrowLeft'||e.key==='ArrowDown'){set(pos-step);e.preventDefault();}
+      else if(e.key==='ArrowRight'||e.key==='ArrowUp'){set(pos+step);e.preventDefault();}
+      else if(e.key==='Home'){set(0);e.preventDefault();}
+      else if(e.key==='End'){set(100);e.preventDefault();}
+    });
+    set(52);
+  }
+
+  /* --- reveal --- */
+  if(!window.matchMedia||!matchMedia('(prefers-reduced-motion: reduce)').matches){
+    var els=[].slice.call(document.querySelectorAll('.rv'));
+    if('IntersectionObserver' in window){
+      var io=new IntersectionObserver(function(es){
+        es.forEach(function(en){ if(en.isIntersecting){ en.target.classList.add('in'); io.unobserve(en.target); } });
+      },{rootMargin:'0px 0px -8% 0px',threshold:.06});
+      els.forEach(function(el){io.observe(el);});
+    } else { els.forEach(function(el){el.classList.add('in');}); }
+  } else {
+    [].slice.call(document.querySelectorAll('.rv')).forEach(function(el){el.classList.add('in');});
+  }
+})();
+</script>
+</body>
+</html>

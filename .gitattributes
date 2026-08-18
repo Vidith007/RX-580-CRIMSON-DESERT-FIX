@@ -1,0 +1,30 @@
+# The files under fix/ and source/ are a SHIPPED PAYLOAD with published
+# SHA-256 checksums. Git must never rewrite a byte of them.
+#
+# This is not a style preference. Two concrete failures it prevents:
+#   1. A .cmd file with LF-only line endings can break cmd.exe parsing.
+#   2. Any line-ending rewrite makes the checksums in README.md and
+#      SHA256SUMS.txt wrong for anyone who clones the repo, which defeats
+#      the entire point of publishing them.
+
+fix/**                  -text
+source/**               -text
+SHA256SUMS.txt          -text
+
+# Explicitly binary, so git never diffs or converts them
+*.dll                   binary
+*.zip                   binary
+*.jpg                   binary
+*.jpeg                  binary
+*.png                   binary
+
+# Ordinary repo docs can be normalised as usual
+*.md                    text
+.gitignore              text
+.gitattributes          text
+LICENSE                 text
+NOTICE                  text
+
+# Don't ship repo plumbing or the payload duplicate in a GitHub source archive
+.gitattributes          export-ignore
+.gitignore              export-ignore
