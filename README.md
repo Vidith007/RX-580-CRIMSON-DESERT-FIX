@@ -2,7 +2,7 @@
 
 **Crimson Desert refuses to start on AMD Polaris cards.** This makes it run.
 
-[![Download](https://img.shields.io/badge/download-3.6%20MB-2B5A87?style=flat-square)](https://github.com/Vidith007/RX-580-CRIMSON-DESERT-FIX/raw/main/Crimson-Desert-RX580-Fix.zip)
+[![Download](https://img.shields.io/badge/download-v1.0.0%20%C2%B7%203.6%20MB-2B5A87?style=flat-square)](https://github.com/Vidith007/RX-580-CRIMSON-DESERT-FIX/releases/latest/download/Crimson-Desert-RX580-Fix.zip)
 [![Report](https://img.shields.io/badge/read-the%20full%20report-4E6B33?style=flat-square)](https://vidith007.github.io/RX-580-CRIMSON-DESERT-FIX/)
 ![GPU](https://img.shields.io/badge/GPU-Polaris%20%2F%20GCN4-informational?style=flat-square)
 ![Game](https://img.shields.io/badge/game-1.14.00-informational?style=flat-square)
@@ -59,8 +59,9 @@ No installer, no registry writes, no game file is modified. Five loose files go 
 
 ### 1. Download and unzip
 
-**[Crimson-Desert-RX580-Fix.zip](https://github.com/Vidith007/RX-580-CRIMSON-DESERT-FIX/raw/main/Crimson-Desert-RX580-Fix.zip)** — 3.6 MB.
-Verify it before you use it: [checksums](#verify-your-download).
+**[Download Crimson-Desert-RX580-Fix.zip](https://github.com/Vidith007/RX-580-CRIMSON-DESERT-FIX/releases/latest/download/Crimson-Desert-RX580-Fix.zip)** — v1.0.0, 3.6 MB.
+Verify it before you use it: [checksums](#verify-your-download). Older versions and full release
+notes are on the [releases page](https://github.com/Vidith007/RX-580-CRIMSON-DESERT-FIX/releases).
 
 ### 2. Back up first
 
