@@ -6,6 +6,70 @@
 #
 # Apply with:  patch -p1 < vkd3d-proton-3.0.1-rx580-polaris.patch
 #
+--- a/include/vkd3d_shader.h
++++ b/include/vkd3d_shader.h
+@@ -85,6 +85,26 @@
+     VKD3D_SHADER_META_FLAG_USES_COOPERATIVE_MATRIX = 1 << 24,
+     VKD3D_SHADER_META_FLAG_USES_COOPERATIVE_MATRIX_FP8 = 1 << 25,
+     VKD3D_SHADER_META_FLAG_FORCE_GRAPHICS_BARRIER_BEFORE_RENDER_PASS = 1 << 26,
++    /* Set by any compile that knows about the two flags below, so that their absence
++     * on a shader deserialized from an older cache reads as "unknown" rather than as
++     * "does not read root constants". Never infer anything from the two flags below
++     * unless this one is also set. */
++    VKD3D_SHADER_META_FLAG_ROOT_CONSTANT_INFO_VALID = 1u << 27,
++    /* The shader loads a word of the root parameter block that a command signature is
++     * allowed to rewrite per command, i.e. one of the application's own root constants.
++     * A pixel shader that does cannot ride the chunked multi-draw path in ExecuteIndirect
++     * emulation: it has no DrawIndex to select its command's block with.
++     *
++     * Deliberately narrower than "loads from the root parameter block at all". The
++     * emulation path accepts exactly one CONSTANT argument and snapshots every other root
++     * parameter once, copying that snapshot into all of the blocks, so bindless
++     * descriptor table offsets and root descriptor addresses hold the same value in every
++     * block. A pixel shader reading only those is safe to fold. Counting those reads too
++     * is what made the first build veto every pipeline in this bindless engine. */
++    VKD3D_SHADER_META_FLAG_READS_ROOT_CONSTANTS = 1u << 28,
++    /* The root parameter block was emitted as a DrawIndex-indexed array, so this stage
++     * can read per-command root constants out of a single multi-draw. */
++    VKD3D_SHADER_META_FLAG_ROOT_CONSTANTS_DRAW_INDEXED = 1u << 29,
+ };
+ 
+ struct vkd3d_shader_meta
+@@ -548,6 +568,15 @@
+ /* Use precise fma instead of the spec correct mad. To workaround issues with invariance. */
+ #define VKD3D_SHADER_QUIRK_PRECISE_FMA (1ull << 33)
+ 
++/* dx12bridge marker (Crimson Desert / AMD Windows Polaris): when present in the
++ * application's global_quirks, vkd3d_compile_shader_stage promotes min16float to
++ * 32-bit for all NON-COMPUTE stages. AMD's Windows Vulkan compiler for Polaris
++ * rejects graphics pipelines carrying Float16 SPIR-V with VK_ERROR_UNKNOWN (-13),
++ * while FP16 compute compiles fine, so the device feature must stay enabled and
++ * the demotion has to happen per-stage instead. Verified by live A/B 2026-08-10:
++ * device-level FP16 off = 0 graphics failures but 5 compute E_INVALIDARG. */
++#define VKD3D_SHADER_QUIRK_GFX_MIN16_AS_32BIT (1ull << 34)
++
+ typedef uint64_t vkd3d_shader_quirks_t;
+ 
+ struct vkd3d_shader_quirk_hash
+@@ -1190,6 +1219,18 @@
+ 
+ uint64_t vkd3d_shader_get_revision(void);
+ 
++/* Number of root parameter blocks the root constant block is emitted as, indexed by
++ * DrawIndex, so that ExecuteIndirect emulation can issue one multi-draw per chunk of
++ * commands instead of one draw plus one descriptor push per command. 0 means the
++ * feature is off, which is the default and keeps SPIR-V generation unchanged.
++ *
++ * Read from VKD3D_DGC_MULTI_DRAW_BLOCKS and cached. It lives here rather than in
++ * vkd3d_config_flags because it is a count, not a flag, and because both the shader
++ * compiler and the command list have to agree on the exact value: it decides the array
++ * length baked into the SPIR-V, the shader cache key, and the size of the uniform
++ * buffer window bound per chunk. One definition, one parse, no way for them to drift. */
++unsigned int vkd3d_shader_root_constant_draw_index_blocks(void);
++
+ int vkd3d_shader_parse_root_signature_v_1_0(const struct vkd3d_shader_code *dxbc,
+         struct vkd3d_versioned_root_signature_desc *desc,
+         vkd3d_shader_hash_t *compatibility_hash);
 --- a/libs/vkd3d/cache.c
 +++ b/libs/vkd3d/cache.c
 @@ -3207,6 +3207,14 @@
@@ -54,10 +118,151 @@
          flags |= VKD3D_PIPELINE_LIBRARY_FLAG_SAVE_FULL_SPIRV;
 --- a/libs/vkd3d/command.c
 +++ b/libs/vkd3d/command.c
-@@ -8833,6 +8833,131 @@
+@@ -28,6 +28,18 @@
+ #include "vkd3d_renderdoc.h"
+ #endif
+ 
++/* Tag every d3d12_command_list_flush_dgc_batch call site with its source line, so the
++ * emulation tally can say which command is ending the batches rather than leaving it to be
++ * guessed. Measured need: with batching on, 1301669 of 1987543 batches held exactly one
++ * ExecuteIndirect - 14.6% of the calls paying 65.5% of the remaining pipeline drains - and
++ * which of the 44 flush sites is responsible is not derivable by reading the code, because
++ * it depends on what this particular engine interleaves between its indirect draws.
++ *
++ * The parentheses around the name in the wrapper definition below suppress this macro; the
++ * two-argument _at form is what the header exports for other translation units. */
++#define d3d12_command_list_flush_dgc_batch(list) \
++        d3d12_command_list_flush_dgc_batch_at((list), __LINE__)
++
+ static HRESULT d3d12_fence_signal(struct d3d12_fence *fence, struct vkd3d_fence_worker *worker, uint64_t value);
+ static void d3d12_command_queue_add_submission(struct d3d12_command_queue *queue,
+         const struct d3d12_command_queue_submission *sub);
+@@ -6767,6 +6779,12 @@
+                 barrier.dstStageMask |= VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+             }
+ 
++            if (iteration->indirect_meta.need_compute_to_graphics_cbv_barrier)
++            {
++                barrier.dstAccessMask |= VK_ACCESS_2_UNIFORM_READ_BIT;
++                barrier.dstStageMask |= VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT;
++            }
++
+             memset(&dep_info, 0, sizeof(dep_info));
+             dep_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+             dep_info.memoryBarrierCount = 1;
+@@ -7146,6 +7164,10 @@
+     memset(&list->graphics_bindings, 0, sizeof(list->graphics_bindings));
+     memset(&list->compute_bindings, 0, sizeof(list->compute_bindings));
+     memset(&list->descriptor_heap, 0, sizeof(list->descriptor_heap));
++    /* Not zero: zero is a heap_count an application may legally pass, and matching it here
++     * would let the elide answer the first bind on a fresh list out of a cache that reset
++     * has just invalidated. */
++    list->applied_descriptor_heap_count = VKD3D_APPLIED_HEAPS_UNKNOWN;
+ 
+     if (vkd3d_descriptor_debug_active_instruction_qa_checks())
+     {
+@@ -8833,6 +8855,362 @@
      return true;
  }
  
++/* Where each unrolled ExecuteIndirect managed to put its patch compute, and what that
++ * cost. The number that matters is rpBreak.
++ *
++ * The patch is a compute dispatch, so when it has to be recorded into the main command
++ * buffer the render pass has to end and restart around it, and on this hardware that is a
++ * full pipeline drain. Once per ExecuteIndirect, a few hundred times a frame, that holds
++ * the GPU at high measured occupancy while it never gets enough work in flight to draw
++ * its power budget - which is exactly the shape of a device reporting near-100% busy at a
++ * third of its rated watts. Same racy-by-design accounting as the counters further down:
++ * a torn read costs a slightly wrong diagnostic and nothing else. */
++enum vkd3d_dgc_hoist_outcome
++{
++    VKD3D_DGC_HOIST_OK = 0,     /* patch went in its own command buffer, render pass left alone */
++    VKD3D_DGC_HOIST_INLINE,     /* patch had to go inline, with the drain that implies */
++    VKD3D_DGC_HOIST_SPLIT,      /* a sequence split bought the hoist back */
++    VKD3D_DGC_HOIST_RP_BREAK,   /* render passes this path ended */
++    VKD3D_DGC_HOIST_NO_BUDGET,  /* this list had already spent its split allowance */
++    VKD3D_DGC_HOIST_NO_QUERY,   /* a scoped query or a pending DGC batch forbade the split */
++    VKD3D_DGC_HOIST_FAILED,     /* split attempted and refused anyway - command buffer alloc */
++    VKD3D_DGC_HOIST_REALIAS,    /* INDIRECT_ARGUMENT transitions that re-aliased the buffer */
++    VKD3D_DGC_HOIST_COUNT,
++};
++
++static uint32_t vkd3d_dgc_hoist[VKD3D_DGC_HOIST_COUNT];
++
++static const char *vkd3d_dgc_hoist_outcome_name(enum vkd3d_dgc_hoist_outcome o)
++{
++    static const char *names[VKD3D_DGC_HOIST_COUNT] =
++    {
++        "ok", "inline", "split", "rpBreak", "noBudget", "noQuery", "failed", "realias",
++    };
++
++    return names[o];
++}
++
++/* Kill switch for splitting the command list to win the hoist back. Host-side only, and
++ * deliberately not folded into vkd3d_compute_shader_interface_key(): it changes which
++ * command buffer a dispatch is recorded into and nothing about the emitted SPIR-V, so it
++ * can be A/B'd from the ini without paying for a cold shader recompile. */
++static bool d3d12_dgc_hoist_patch_enabled(void)
++{
++    static int cached = -1;
++    char env[32];
++
++    if (cached < 0)
++    {
++        cached = vkd3d_get_env_var("VKD3D_DGC_HOIST_PATCH", env, sizeof(env))
++                ? strtoul(env, NULL, 0) != 0 : 1;
++    }
++
++    return cached != 0;
++}
++
++/* How many times one command list may split to un-alias its patch command buffer. Each split
++ * costs one more command buffer in the submission, so this is a budget rather than "as often
++ * as possible" - but the default spends the whole compile-time bound, because the thing it is
++ * buying back is a full GPU drain per ExecuteIndirect and that is far more expensive than a
++ * command buffer. Tunable from the ini so the budget can be swept without a rebuild; clamped
++ * to the bound because iterations[] is sized by it. */
++static unsigned int d3d12_dgc_hoist_max_splits(void)
++{
++    static unsigned int cached = ~0u;
++    char env[32];
++
++    if (cached == ~0u)
++    {
++        unsigned int v = VKD3D_MAX_COMMAND_LIST_SEQUENCES - 1;
++
++        if (vkd3d_get_env_var("VKD3D_DGC_HOIST_MAX_SPLITS", env, sizeof(env)))
++        {
++            v = strtoul(env, NULL, 0);
++            if (v > VKD3D_MAX_COMMAND_LIST_SEQUENCES - 1)
++                v = VKD3D_MAX_COMMAND_LIST_SEQUENCES - 1;
++        }
++
++        cached = v;
++    }
++
++    return cached;
++}
++
++/* Kill switch for turning each unrolled chunk into a draw-indirect-COUNT instead of a
++ * fixed-count multi-draw. Host-side only and safe to A/B from the ini: it changes how many
++ * commands the GPU fetches, not what the shaders are, so it costs no shader recompile. */
++static bool d3d12_dgc_count_draw_enabled(void)
++{
++    static int cached = -1;
++    char env[32];
++
++    if (cached < 0)
++    {
++        cached = vkd3d_get_env_var("VKD3D_DGC_COUNT_DRAW", env, sizeof(env))
++                ? strtoul(env, NULL, 0) != 0 : 1;
++    }
++
++    return cached != 0;
++}
++
 +/* Emulates the per-command root constants of ExecuteIndirect on a device with no
 + * VK_EXT_device_generated_commands.
 + *
@@ -71,14 +276,24 @@
 + * The caller then rebinds the push UBO to block i and issues a one-command
 + * indirect draw for each i. Vulkan cannot source a push constant from a buffer,
 + * so a rebindable uniform buffer is the only channel that can carry a value out
-+ * of device memory into both the vertex and the pixel stage. */
++ * of device memory into both the vertex and the pixel stage.
++ *
++ * When the caller is going to issue the commands in chunks of chunk_blocks and the device
++ * can do draw-indirect-COUNT, the same pass also writes one draw count per chunk. Zeroed
++ * arguments make a command draw nothing, but the command processor still fetches and
++ * retires its packet, and this game declares roughly an order of magnitude more commands
++ * than the count buffer names - so those empty packets, not the real draws, are most of
++ * the front end's work. A count buffer lets whole chunks past the real count be skipped. */
 +static bool d3d12_command_list_emit_unroll_draw_indirect(struct d3d12_command_list *list,
 +        VkDeviceAddress indirect_args, VkDeviceAddress count_arg,
 +        uint32_t stride, uint32_t max_commands,
 +        uint32_t action_word_offset, uint32_t action_words,
 +        uint32_t constant_dest_word, uint32_t constant_words,
++        uint32_t chunk_blocks,
 +        struct vkd3d_scratch_allocation *args_scratch,
-+        struct vkd3d_scratch_allocation *root_scratch)
++        struct vkd3d_scratch_allocation *root_scratch,
++        struct vkd3d_scratch_allocation *counts_scratch,
++        bool batched, bool *patch_inline)
 +{
 +    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
 +    union vkd3d_root_parameter_data root_parameter_data;
@@ -88,6 +303,7 @@
 +    VkCommandBuffer vk_patch_cmd_buffer;
 +    VkMemoryBarrier2 vk_barrier;
 +    VkDependencyInfo dep_info;
++    bool emit_counts;
 +
 +    vkd3d_meta_get_unroll_draw_indirect_pipeline(&list->device->meta_ops, &pipeline_info);
 +
@@ -101,6 +317,30 @@
 +            sizeof(root_parameter_data) * max_commands,
 +            D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, ~0u, root_scratch))
 +        return false;
++
++    /* Nothing to count against without a count buffer: every declared command is then a
++     * real one, and the counts would all come back full. Leaving the allocation out keeps
++     * the draw path on its existing fixed-count multi-draw, which is exactly equivalent. */
++    memset(counts_scratch, 0, sizeof(*counts_scratch));
++
++    emit_counts = chunk_blocks > 1 && count_arg && d3d12_dgc_count_draw_enabled() &&
++            list->device->device_info.vulkan_1_2_features.drawIndirectCount;
++
++    if (emit_counts)
++    {
++        uint32_t chunks = (max_commands + chunk_blocks - 1) / chunk_blocks;
++
++        /* Same pool as args_scratch, which is already bound directly as an indirect
++         * buffer below, so the usage flags needed to read this as a draw count are
++         * known to be there. */
++        if (!d3d12_command_allocator_allocate_scratch_memory(list->allocator,
++                VKD3D_SCRATCH_POOL_KIND_DEVICE_STORAGE,
++                sizeof(uint32_t) * chunks, sizeof(uint32_t), ~0u, counts_scratch))
++        {
++            memset(counts_scratch, 0, sizeof(*counts_scratch));
++            emit_counts = false;
++        }
++    }
 +
 +    /* The compute pass has to read the template, so it goes in host visible
 +     * scratch rather than a push constant: the block is 256 bytes and the push
@@ -116,21 +356,117 @@
 +    d3d12_command_list_fetch_root_parameter_data(list, &list->graphics_bindings, &root_parameter_data);
 +    memcpy(template_scratch.host_ptr, &root_parameter_data, sizeof(root_parameter_data));
 +
-+    d3d12_command_list_end_current_render_pass(list, false);
++    /* Flush pending copies first. Safe to do with a render pass still open: it returns
++     * immediately when nothing is batched, and ends the render pass itself when there is
++     * something, so it only costs a pass break when one was unavoidable anyway. */
 +    d3d12_command_list_end_transfer_batch(list);
 +
++    /* Find out where the patch compute can go before touching the render pass, because if
++     * it can have a command buffer of its own then the render pass does not have to end at
++     * all - everything below records into vk_patch_cmd_buffer and nothing into the main
++     * one. Upstream ends it first and unconditionally, which spends a pipeline drain on
++     * every single ExecuteIndirect. Allocating here is a no-op when the buffer already
++     * exists or has been aliased onto the main buffer, and it only ever touches a
++     * different command buffer, so it is safe to ask from inside a render pass. */
 +    d3d12_command_allocator_allocate_init_post_indirect_command_buffer(list->allocator, list);
++
++    if (list->cmd.vk_post_indirect_barrier_commands == list->cmd.vk_command_buffer)
++    {
++        /* Aliased, so the dispatch has to go inline and the render pass has to end. A
++         * transition to INDIRECT_ARGUMENT did that, and the repair upstream uses for it is
++         * reachable only through a DGC layout object, which a device without
++         * device-generated commands never builds - so left alone, the alias and the drain
++         * last for the rest of the command list.
++         *
++         * Pay the break this call was going to pay anyway, then split the sequence so the
++         * next call gets a real patch buffer and pays nothing.
++         *
++         * The split is what makes this correct rather than merely fast. The patch reads
++         * indirect arguments the application may have written earlier in this same command
++         * buffer, so it cannot simply be hoisted ahead of them. Moving it into the next
++         * iteration preserves the order: a list that observed an indirect argument barrier
++         * is always submitted with each iteration's patch buffer immediately before that
++         * iteration's main buffer, so writes recorded in iteration N still complete before
++         * the patch in iteration N + 1.
++         *
++         * None of that applies when the caller is replaying a batch. The batch flush has
++         * already ended the render pass once, for the whole batch, and emits the single
++         * barrier after the last dispatch itself. Splitting here would be actively wrong
++         * rather than merely wasteful: it would move the remaining dispatches into a new
++         * command buffer while every draw that consumes them goes into the buffer after
++         * that, leaving the barrier on the wrong side of the dispatches it orders.
++         *
++         * The split is also known to be unreachable in this game regardless. Instrumenting
++         * every gate over two full sessions gave noQuery=685325 of 685335 attempts, i.e.
++         * essentially all of them: the engine holds a scoped occlusion query open across
++         * its indirect draws, vkCmdBeginQuery and vkCmdEndQuery have to be in the same
++         * command buffer, so a split there would be illegal. Batching is the repair that
++         * works because it moves the dispatches within one command buffer instead of
++         * between two. */
++        if (!batched)
++        {
++            d3d12_command_list_end_current_render_pass(list, false);
++            vkd3d_dgc_hoist[VKD3D_DGC_HOIST_RP_BREAK]++;
++
++            if (d3d12_dgc_hoist_patch_enabled())
++            {
++                unsigned int iterations = list->cmd.iteration_count;
++
++                /* Deliberately not d3d12_command_list_consider_new_sequence(): that gate also reads
++                 * device->device_has_dgc_templates, and on a device without device-generated
++                 * commands the store that would set it is skipped by an early goto in command
++                 * signature creation - so it is nailed to zero and the split can never happen. That
++                 * flag is only a "does this game use fancy ExecuteIndirect, so is reordering worth
++                 * the extra command buffer?" heuristic, and being inside the ExecuteIndirect
++                 * emulation path answers it yes by construction. The conditions it guards that do
++                 * matter for correctness are checked here instead.
++                 *
++                 * iteration_count is 1 before the first split, so it doubles as "splits spent + 1".
++                 * The render pass has just been ended, so VKD3D_RENDERING_ACTIVE is clear and the
++                 * end_rendering inside begin_new_sequence cannot recurse back into here. */
++                if (iterations > d3d12_dgc_hoist_max_splits())
++                    vkd3d_dgc_hoist[VKD3D_DGC_HOIST_NO_BUDGET]++;
++                else if (!d3d12_command_list_allows_new_sequence(list))
++                    vkd3d_dgc_hoist[VKD3D_DGC_HOIST_NO_QUERY]++;
++                else
++                {
++                    d3d12_command_list_begin_new_sequence(list, false);
++
++                    if (list->cmd.iteration_count != iterations)
++                    {
++                        vkd3d_dgc_hoist[VKD3D_DGC_HOIST_SPLIT]++;
++                        d3d12_command_allocator_allocate_init_post_indirect_command_buffer(list->allocator, list);
++                    }
++                    else
++                    {
++                        /* Only reachable if the command buffer allocation failed, which it already
++                         * logged. Counted separately so it can never be mistaken for a refused gate. */
++                        vkd3d_dgc_hoist[VKD3D_DGC_HOIST_FAILED]++;
++                    }
++                }
++            }
++        }
++    }
++
 +    vk_patch_cmd_buffer = list->cmd.vk_post_indirect_barrier_commands;
++
++    if (patch_inline)
++        *patch_inline = vk_patch_cmd_buffer == list->cmd.vk_command_buffer;
 +
 +    if (vk_patch_cmd_buffer == list->cmd.vk_command_buffer)
 +    {
++        vkd3d_dgc_hoist[VKD3D_DGC_HOIST_INLINE]++;
 +        d3d12_command_list_invalidate_current_pipeline(list, true);
 +        d3d12_command_list_invalidate_root_parameters(list, &list->compute_bindings, true, &list->graphics_bindings);
 +    }
 +    else
 +    {
++        vkd3d_dgc_hoist[VKD3D_DGC_HOIST_OK]++;
 +        list->cmd.indirect_meta->need_compute_to_indirect_barrier = true;
 +        list->cmd.indirect_meta->need_compute_to_cbv_barrier = true;
++        /* The blocks are read as a uniform buffer by this draw's own graphics stages, which
++         * the flag above stops short of. */
++        list->cmd.indirect_meta->need_compute_to_graphics_cbv_barrier = true;
 +    }
 +
 +    args.indirect_va = indirect_args;
@@ -138,6 +474,7 @@
 +    args.output_args_va = args_scratch->va;
 +    args.root_template_va = template_scratch.va;
 +    args.output_root_va = root_scratch->va;
++    args.output_count_va = emit_counts ? counts_scratch->va : 0;
 +    args.stride_words = stride / sizeof(uint32_t);
 +    args.max_commands = max_commands;
 +    args.action_word_offset = action_word_offset;
@@ -147,6 +484,7 @@
 +    args.constant_dest_word = constant_dest_word;
 +    args.constant_words = constant_words;
 +    args.has_count = count_arg ? 1u : 0u;
++    args.chunk_blocks = emit_counts ? chunk_blocks : 0;
 +
 +    VK_CALL(vkCmdBindPipeline(vk_patch_cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
 +            pipeline_info.vk_pipeline));
@@ -158,7 +496,7 @@
 +            vkd3d_compute_workgroup_count(max_commands, vkd3d_meta_get_unroll_draw_indirect_workgroup_size()),
 +            1, 1));
 +
-+    if (vk_patch_cmd_buffer == list->cmd.vk_command_buffer)
++    if (vk_patch_cmd_buffer == list->cmd.vk_command_buffer && !batched)
 +    {
 +        memset(&dep_info, 0, sizeof(dep_info));
 +        dep_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
@@ -186,7 +524,498 @@
  static bool d3d12_command_list_emit_predicated_command(struct d3d12_command_list *list,
          enum vkd3d_predicate_command_type command_type, VkDeviceAddress indirect_args,
          const union vkd3d_predicate_command_direct_args *direct_args, struct vkd3d_scratch_allocation *scratch)
-@@ -17099,6 +17224,372 @@
+@@ -13151,6 +13529,11 @@
+                 {
+                     d3d12_command_list_debug_mark_label(list, "Indirect Argument barrier", 1.0f, 1.0f, 0.0f, 1.0f);
+                     /* Any indirect patching commands now have to go to normal command buffer, unless we split the sequence. */
++                    /* Counted only when it actually re-aliases, so the total is the number of
++                     * splits the application's barrier pattern demands - which is what decides
++                     * whether one split per command list can ever be enough. */
++                    if (list->cmd.vk_post_indirect_barrier_commands != list->cmd.vk_command_buffer)
++                        vkd3d_dgc_hoist[VKD3D_DGC_HOIST_REALIAS]++;
+                     list->cmd.vk_post_indirect_barrier_commands = list->cmd.vk_command_buffer;
+                     list->cmd.observes_indirect_argument_barrier = true;
+                 }
+@@ -13516,13 +13899,63 @@
+     vkd3d_pipeline_bindings_set_dirty_sets(&list->compute_bindings, dirty_mask);
+ }
+ 
++/* Opt-out lever for the redundant-heap-bind elide below. Set VKD3D_DGC_HEAP_ELIDE=0 to go
++ * back to flushing the deferred batch on every SetDescriptorHeaps, which is the behaviour
++ * every measurement before this change was taken against. */
++static bool d3d12_dgc_heap_elide_enabled(void)
++{
++    static int cached = -1;
++    char env[32];
++
++    if (cached < 0)
++    {
++        cached = (vkd3d_get_env_var("VKD3D_DGC_HEAP_ELIDE", env, sizeof(env))
++                && strcmp(env, "0") == 0) ? 0 : 1;
++    }
++
++    return cached != 0;
++}
++
++/* Defined next to the other emulation tallies further down in this file; forward-declared
++ * because this call site sits well above them. */
++static void vkd3d_ei_batch_stat_heap_bind(bool redundant);
++
+ static void STDMETHODCALLTYPE d3d12_command_list_SetDescriptorHeaps(d3d12_command_list_iface *iface,
+         UINT heap_count, ID3D12DescriptorHeap *const *heaps)
+ {
+     struct d3d12_command_list *list = impl_from_ID3D12GraphicsCommandList(iface);
++    unsigned int i;
+ 
+     TRACE("iface %p, heap_count %u, heaps %p.\n", iface, heap_count, heaps);
+ 
++    /* Engines re-bind the same heaps at every phase boundary, and each of those calls used
++     * to flush the deferred ExecuteIndirect batch - a full GPU pipeline drain - for state
++     * that did not change. Skipping that is sound because everything the two setters below
++     * read out of a heap (its type, its descriptor sets, its buffer VA and offsets, its CPU
++     * VA) is written once inside d3d12_descriptor_heap_create and never mutated afterwards,
++     * so the same heap objects in the same order always reproduce the same bound state.
++     * This is a property of the heap, not an assumption about the application.
++     *
++     * The count is VKD3D_APPLIED_HEAPS_UNKNOWN after a reset, so the first bind on a fresh
++     * command list always goes through in full and the elide can never stand in for state
++     * that reset cleared. */
++    if (d3d12_dgc_heap_elide_enabled() &&
++            list->applied_descriptor_heap_count == heap_count &&
++            heap_count <= ARRAY_SIZE(list->applied_descriptor_heaps))
++    {
++        for (i = 0; i < heap_count; i++)
++            if (heaps[i] != list->applied_descriptor_heaps[i])
++                break;
++
++        if (i == heap_count)
++        {
++            vkd3d_ei_batch_stat_heap_bind(true);
++            return;
++        }
++    }
++
++    vkd3d_ei_batch_stat_heap_bind(false);
++
+     /* We don't capture heap state as part of DGC batch. */
+     d3d12_command_list_flush_dgc_batch(list);
+ 
+@@ -13530,6 +13963,18 @@
+         d3d12_command_list_set_descriptor_heaps_buffers(list, heap_count, heaps);
+     else
+         d3d12_command_list_set_descriptor_heaps_sets(list, heap_count, heaps);
++
++    if (heap_count <= ARRAY_SIZE(list->applied_descriptor_heaps))
++    {
++        for (i = 0; i < heap_count; i++)
++            list->applied_descriptor_heaps[i] = heaps[i];
++        list->applied_descriptor_heap_count = heap_count;
++    }
++    else
++    {
++        /* Wider than D3D12 permits, so do not try to remember it. */
++        list->applied_descriptor_heap_count = VKD3D_APPLIED_HEAPS_UNKNOWN;
++    }
+ }
+ 
+ static void d3d12_command_list_set_root_signature(struct d3d12_command_list *list,
+@@ -16983,7 +17428,189 @@
+     }
+ }
+ 
+-void d3d12_command_list_flush_dgc_batch(struct d3d12_command_list *list)
++/* Which half of the emulated ExecuteIndirect to record. The emulation is a compute
++ * dispatch that builds the draw arguments and the per-command root parameter blocks,
++ * followed by the draws that read both - and the draws cannot start until the dispatch
++ * has finished, so on a command buffer they have to share there is a barrier between
++ * them. Recorded one call at a time that barrier is a full compute-to-graphics drain per
++ * ExecuteIndirect, with the render pass ended and restarted around it.
++ *
++ * Splitting the two halves lets a whole batch of calls put its dispatches first and its
++ * draws afterwards, so the batch pays one drain instead of one per call. */
++enum vkd3d_ei_emulate_mode
++{
++    /* Dispatch and draws in one go, barrier included. What a call that is not batched
++     * does, and what a batch of exactly one collapses to, since splitting a single call
++     * into two passes would emit the identical command stream. */
++    VKD3D_EI_EMULATE_ALL = 0,
++    /* Dispatch only. The render pass is already closed and stays closed; no barrier and
++     * no sequence split. The scratch it wrote is handed back through the batch entry. */
++    VKD3D_EI_EMULATE_PATCH,
++    /* Draws only, reading the scratch the PATCH pass recorded into. */
++    VKD3D_EI_EMULATE_DRAW,
++    /* The application just called ExecuteIndirect. Defer it into the batch if it is
++     * eligible, otherwise fall through and behave exactly like ALL.
++     *
++     * This is deliberately a separate mode from ALL rather than a flag, because the two
++     * callers are the application and the batch replay, and only one of them may defer.
++     * Deferring from the replay is not a missed optimisation, it is a hang: the replay loop
++     * reads dgc_batch.draws_count as its bound on every iteration, so an entry that
++     * re-defers appends the work the loop is about to reach, and the loop extends itself
++     * forever while vkd3d_array_reserve grows a 5 KB-per-entry array until host allocation
++     * fails. That is measured, not hypothetical - the first build of this change replayed
++     * single-entry batches as ALL and died at 4 minutes with "vkd3d_realloc: Out of memory"
++     * on three threads and VK_ERROR_OUT_OF_HOST_MEMORY out of vkCreateGraphicsPipelines.
++     * The replay loop is bounded independently now as well, so this can only cost a draw,
++     * never a hang - but the reason the two modes are distinct is this. */
++    VKD3D_EI_EMULATE_TRY_DEFER,
++};
++
++/* Not const, unlike every other reader of a command signature here: a deferred entry has to
++ * store the signature pointer into the batch, and vkd3d_dgc_batch_draw::signature is a
++ * plain pointer because the DGC path that owns the struct mutates the signature's cached
++ * indirect-commands layout. */
++static bool d3d12_command_list_execute_indirect_emulate_root_constants(
++        struct d3d12_command_list *list, struct d3d12_command_signature *sig_impl,
++        uint32_t max_command_count,
++        struct d3d12_resource *arg_impl, uint64_t arg_buffer_offset_command,
++        struct d3d12_resource *count_impl, uint64_t count_buffer_offset,
++        enum vkd3d_ei_emulate_mode mode, struct vkd3d_dgc_batch_draw *batch_entry);
++
++/* Largest batch that will be accumulated before it is flushed on the spot. See the comment
++ * at the cap check for why this is bounded at all; 256 entries is about 1.25 MB of high
++ * water mark per command list and already turns 256 drains into one. */
++#define VKD3D_EI_EMULATE_BATCH_MAX 256
++
++/* How the emulated ExecuteIndirect batches turned out. Reported alongside the other
++ * emulation tallies so a batch that silently never grows past one is visible rather than
++ * inferred from an unchanged frame rate. */
++enum vkd3d_ei_batch_stat
++{
++    VKD3D_EI_BATCH_DEFERRED,    /* calls that went into a batch instead of recording */
++    VKD3D_EI_BATCH_INLINE,      /* calls that had to record immediately */
++    VKD3D_EI_BATCH_FLUSHES,     /* batches replayed */
++    VKD3D_EI_BATCH_SINGLETON,   /* of those, ones holding a single call, so no drain saved */
++    VKD3D_EI_BATCH_TWO_PASS,    /* of those, ones that actually ran dispatches-then-draws */
++    VKD3D_EI_BATCH_DRAINS,      /* barriers the two-pass replays emitted, i.e. drains paid */
++    VKD3D_EI_BATCH_CAPPED,      /* flushes forced by the size cap rather than by a command */
++    VKD3D_EI_BATCH_BIGGEST,     /* largest batch seen (a maximum, not a count) */
++    /* The barrier-crossing predicate below: how often a live batch survived an application
++     * barrier instead of being flushed by it, and why not when it did not. Split by reason
++     * because "the predicate never fires" and "the predicate fires but the engine's barriers
++     * all name a graphics source scope" call for completely different next moves. */
++    VKD3D_EI_BATCH_BXOK,        /* barrier crossed with a live batch, so no drain paid */
++    VKD3D_EI_BATCH_BXSYNC,      /* refused: SyncBefore could name the deferred draws */
++    VKD3D_EI_BATCH_BXTEX,       /* refused: a texture group, so a layout transition */
++    VKD3D_EI_BATCH_BXOTHER,     /* refused: split barrier, unknown group type, or lever off */
++    /* SetDescriptorHeaps used to flush unconditionally. These two say how the calls split
++     * between genuine heap changes and redundant re-binds, so "the elide is worth having"
++     * stops being an assumption about the engine and becomes a number in the log. */
++    VKD3D_EI_BATCH_HEAPSAME,    /* re-bound the heaps already bound, so no flush paid */
++    VKD3D_EI_BATCH_HEAPSET,     /* heaps actually changed, so the flush was required */
++    VKD3D_EI_BATCH_COUNT,
++};
++
++static uint32_t vkd3d_ei_batch_stat[VKD3D_EI_BATCH_COUNT];
++
++static void vkd3d_ei_batch_stat_heap_bind(bool redundant)
++{
++    vkd3d_ei_batch_stat[redundant ? VKD3D_EI_BATCH_HEAPSAME : VKD3D_EI_BATCH_HEAPSET]++;
++}
++
++static const char *vkd3d_ei_batch_stat_name(enum vkd3d_ei_batch_stat s)
++{
++    static const char *names[VKD3D_EI_BATCH_COUNT] =
++    {
++        "deferred", "inline", "flushes", "singleton", "twoPass", "drains", "capped",
++        "biggest", "bxOk", "bxSync", "bxTex", "bxOther", "heapSame", "heapSet",
++    };
++
++    return names[s];
++}
++
++/* Opt-out lever for the batching. Set VKD3D_DGC_EMULATE_BATCH=0 to go back to recording
++ * every emulated ExecuteIndirect at the moment the application makes it, which is the
++ * behaviour every earlier measurement on this game was taken against. */
++static bool d3d12_dgc_emulate_batch_enabled(void)
++{
++    static int cached = -1;
++    char env[32];
++
++    if (cached < 0)
++    {
++        cached = (vkd3d_get_env_var("VKD3D_DGC_EMULATE_BATCH", env, sizeof(env))
++                && strcmp(env, "0") == 0) ? 0 : 1;
++    }
++
++    return cached != 0;
++}
++
++/* Opt-out lever for letting a batch survive an application barrier. Set
++ * VKD3D_DGC_BARRIER_DEFER=0 to make d3d12_command_list_Barrier flush unconditionally again,
++ * which is what upstream does and what every measurement before this change was taken
++ * against. Separate from VKD3D_DGC_EMULATE_BATCH on purpose: batching is proven on this game
++ * and reordering work across a barrier is the newer and riskier half, so it has to be
++ * possible to turn the second off without losing the first. */
++static bool d3d12_dgc_barrier_defer_enabled(void)
++{
++    static int cached = -1;
++    char env[32];
++
++    if (cached < 0)
++    {
++        cached = (vkd3d_get_env_var("VKD3D_DGC_BARRIER_DEFER", env, sizeof(env))
++                && strcmp(env, "0") == 0) ? 0 : 1;
++    }
++
++    return cached != 0;
++}
++
++/* Which source lines flush the batch, and how often the batch they flushed held exactly one
++ * entry. Only actual flushes are recorded - a call that finds the batch already empty is a
++ * no-op and says nothing about who ends batches. Linear scan over at most 44 slots, on a
++ * path that already does far more work than a 44-element compare. */
++#define VKD3D_EI_FLUSH_SITE_MAX 48
++
++static struct
++{
++    unsigned int site;
++    uint32_t flushes;
++    uint32_t singletons;
++    uint32_t entries;
++} vkd3d_ei_flush_site[VKD3D_EI_FLUSH_SITE_MAX];
++
++static uint32_t vkd3d_ei_flush_site_count;
++
++static void vkd3d_ei_flush_site_record(unsigned int site, size_t num_draws)
++{
++    uint32_t i;
++
++    for (i = 0; i < vkd3d_ei_flush_site_count; i++)
++    {
++        if (vkd3d_ei_flush_site[i].site == site)
++            break;
++    }
++
++    if (i == vkd3d_ei_flush_site_count)
++    {
++        if (i >= VKD3D_EI_FLUSH_SITE_MAX)
++            return;
++        vkd3d_ei_flush_site_count = i + 1;
++        vkd3d_ei_flush_site[i].site = site;
++    }
++
++    vkd3d_ei_flush_site[i].flushes++;
++    vkd3d_ei_flush_site[i].entries += (uint32_t)num_draws;
++    if (num_draws == 1)
++        vkd3d_ei_flush_site[i].singletons++;
++}
++
++void (d3d12_command_list_flush_dgc_batch)(struct d3d12_command_list *list)
++{
++    d3d12_command_list_flush_dgc_batch_at(list, 0);
++}
++
++void d3d12_command_list_flush_dgc_batch_at(struct d3d12_command_list *list, unsigned int site)
+ {
+     struct vkd3d_pipeline_bindings graphics_bindings;
+     const struct vkd3d_vk_device_procs *vk_procs;
+@@ -16991,7 +17618,10 @@
+     struct vkd3d_index_buffer index_buffer;
+     struct d3d12_pipeline_state *state;
+     struct vkd3d_dgc_batch_draw *draw;
+-    size_t i, iter, num_iter;
++    size_t i, iter, num_iter, num_draws;
++    bool patch_inline;
++    bool has_emulate;
++    bool has_dgc;
+     HRESULT hr;
+ 
+     if (list->dgc_batch.draws_count == 0)
+@@ -17004,30 +17634,105 @@
+     index_buffer = list->index_buffer;
+     state = list->state;
+ 
+-    num_iter = list->dgc_batch.draws_count > 1 ? 2 : 1;
++    /* Snapshot rather than reading dgc_batch.draws_count in the loop conditions below.
++     * The replay calls back into the same recording paths the application uses, and if any
++     * of them ever appends to the batch, a loop bounded by the live count appends the work
++     * it is about to reach and never terminates - it grows a 5 KB-per-entry array until host
++     * allocation fails. That happened for real: the first build of this change replayed a
++     * one-entry batch in a mode that re-deferred it, and the game died at four minutes with
++     * "vkd3d_realloc: Out of memory" on three threads. VKD3D_EI_EMULATE_TRY_DEFER fixes the
++     * cause; this bounds the blast radius of any future one, turning a hang into at worst a
++     * late draw plus the log line below. */
++    num_draws = list->dgc_batch.draws_count;
++    num_iter = num_draws > 1 ? 2 : 1;
++
++    vkd3d_ei_flush_site_record(site, num_draws);
++
++    /* Which kinds of entry are in here decides which barrier separates the two passes.
++     * On a device without device-generated commands every entry is an emulated one, and
++     * on a device with them none are, but nothing guarantees that so both are handled. */
++    has_emulate = false;
++    has_dgc = false;
++    for (i = 0; i < num_draws; i++)
++    {
++        if (list->dgc_batch.draws[i].emulate)
++            has_emulate = true;
++        else
++            has_dgc = true;
++    }
++
++    vkd3d_ei_batch_stat[VKD3D_EI_BATCH_FLUSHES]++;
++    if (num_draws == 1)
++        vkd3d_ei_batch_stat[VKD3D_EI_BATCH_SINGLETON]++;
++    else
++        vkd3d_ei_batch_stat[VKD3D_EI_BATCH_TWO_PASS]++;
++    if (num_draws > vkd3d_ei_batch_stat[VKD3D_EI_BATCH_BIGGEST])
++        vkd3d_ei_batch_stat[VKD3D_EI_BATCH_BIGGEST] = (uint32_t)num_draws;
+ 
+     if (num_iter > 1)
+         d3d12_command_list_end_current_render_pass(list, true);
+ 
++    patch_inline = false;
++
+     for (iter = 0; iter < num_iter; iter++)
+     {
+         d3d12_command_list_debug_mark_begin_region(list, iter ? "DGC execute batch" : "DGC preprocess inline batch");
+ 
+-        for (i = 0; i < list->dgc_batch.draws_count; i++)
++        for (i = 0; i < num_draws; i++)
+         {
+             enum vkd3d_dgc_mode dgc_mode;
+             draw = &list->dgc_batch.draws[i];
+ 
+-            /* Lots of weird state stuff to consider, so take the common path until proven necessary to make it faster. */
+-            d3d12_command_list_SetPipelineState(
+-                    &list->ID3D12GraphicsCommandList_iface,
+-                    &draw->state->ID3D12PipelineState_iface);
++            /* Lots of weird state stuff to consider, so take the common path until proven necessary to make it faster.
++             *
++             * Skipped for the dispatch pass of an emulated entry: a compute dispatch that
++             * writes draw arguments needs no graphics pipeline bound, and the one thing it
++             * does read - the root parameter block as the API had it - comes from the
++             * graphics_bindings copy restored just below, not from the pipeline. Fifteen
++             * pipeline binds and fifteen full state invalidations per batch is exactly the
++             * kind of work this change exists to stop paying. */
++            if (!(draw->emulate && num_iter == 2 && iter == 0))
++            {
++                d3d12_command_list_SetPipelineState(
++                        &list->ID3D12GraphicsCommandList_iface,
++                        &draw->state->ID3D12PipelineState_iface);
++            }
+ 
+             list->graphics_bindings = draw->graphics_bindings;
+             list->dynamic_state = draw->dynamic_state;
+             list->index_buffer = draw->index_buffer;
+             d3d12_command_list_invalidate_all_state(list);
+ 
++            if (draw->emulate)
++            {
++                enum vkd3d_ei_emulate_mode mode;
++
++                if (num_iter == 1)
++                    mode = VKD3D_EI_EMULATE_ALL;
++                else if (iter == 0)
++                    mode = VKD3D_EI_EMULATE_PATCH;
++                else
++                    mode = VKD3D_EI_EMULATE_DRAW;
++
++                /* Returning false here means the validation that passed when the call was
++                 * deferred no longer passes on replay, which would mean the restored state
++                 * does not match what was captured. Nothing is known to do that; if it ever
++                 * does, the draw is dropped rather than issued wrong, and the FIXME says so
++                 * once instead of per draw. */
++                if (!d3d12_command_list_execute_indirect_emulate_root_constants(list,
++                        draw->signature, draw->max_command_count,
++                        draw->arg_buffer, draw->arg_buffer_offset,
++                        draw->count_buffer, draw->count_buffer_offset, mode, draw))
++                {
++                    FIXME_ONCE("Deferred indirect draw could not be replayed; dropping it.\n");
++                }
++
++                if (mode == VKD3D_EI_EMULATE_PATCH && draw->emulate_patch_inline)
++                    patch_inline = true;
++
++                continue;
++            }
++
+             if (iter == 0 && num_iter == 2)
+             {
+                 struct vkd3d_scratch_allocation preprocess_allocation;
+@@ -17064,27 +17769,67 @@
+         if (iter == 0 && num_iter == 2)
+         {
+             VkDependencyInfo dep_info;
+-            VkMemoryBarrier2 barrier;
++            VkMemoryBarrier2 barrier[2];
++            uint32_t count = 0;
+ 
+-            memset(&barrier, 0, sizeof(barrier));
+-            barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+-            barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT;
+-            barrier.srcAccessMask = VK_ACCESS_2_COMMAND_PREPROCESS_WRITE_BIT_EXT;
+-            /* vkCmdExecuteGeneratedCommands consumes in draw indirect stage. */
+-            barrier.dstStageMask = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
+-            barrier.dstAccessMask = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
++            memset(barrier, 0, sizeof(barrier));
+ 
+-            memset(&dep_info, 0, sizeof(dep_info));
+-            dep_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+-            dep_info.memoryBarrierCount = 1;
+-            dep_info.pMemoryBarriers = &barrier;
++            if (has_dgc)
++            {
++                barrier[count].sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
++                barrier[count].srcStageMask = VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT;
++                barrier[count].srcAccessMask = VK_ACCESS_2_COMMAND_PREPROCESS_WRITE_BIT_EXT;
++                /* vkCmdExecuteGeneratedCommands consumes in draw indirect stage. */
++                barrier[count].dstStageMask = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
++                barrier[count].dstAccessMask = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
++                count++;
++            }
++
++            /* The emulated entries only need this if at least one dispatch had to share
++             * the command buffer with the draws. When they all got a patch command buffer
++             * of their own, the submission already orders that buffer ahead of this one and
++             * the indirect_meta flags cover the visibility, so a barrier here would be a
++             * drain bought for nothing - which is the entire cost this change removes. */
++            if (has_emulate && patch_inline)
++            {
++                barrier[count].sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
++                barrier[count].srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
++                barrier[count].srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
++                /* The root parameter blocks are read as a uniform buffer by the draws
++                 * themselves, not just by the indirect fetch. */
++                barrier[count].dstStageMask = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT |
++                        VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT;
++                barrier[count].dstAccessMask = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT |
++                        VK_ACCESS_2_UNIFORM_READ_BIT;
++                count++;
++            }
++
++            if (count)
++            {
++                memset(&dep_info, 0, sizeof(dep_info));
++                dep_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
++                dep_info.memoryBarrierCount = count;
++                dep_info.pMemoryBarriers = barrier;
+ 
+-            VK_CALL(vkCmdPipelineBarrier2(list->cmd.vk_command_buffer, &dep_info));
++                VK_CALL(vkCmdPipelineBarrier2(list->cmd.vk_command_buffer, &dep_info));
++                vkd3d_ei_batch_stat[VKD3D_EI_BATCH_DRAINS]++;
++            }
+         }
+ 
+         d3d12_command_list_debug_mark_end_region(list);
+     }
+ 
++    /* Nothing the replay does may append to the batch - see the snapshot comment above. If
++     * that ever stops being true this says so once, and the appended entries are dropped
++     * here rather than replayed later against state that has since moved on. */
++    if (list->dgc_batch.draws_count != num_draws)
++    {
++        FIXME_ONCE("Batch grew from %zu to %zu during its own replay; dropping %zu entries. "
++                "Some indirect draws will be missing.\n",
++                num_draws, (size_t)list->dgc_batch.draws_count,
++                (size_t)list->dgc_batch.draws_count - num_draws);
++    }
++
+     list->dgc_batch.draws_count = 0;
+ 
+     /* Restore state. */
+@@ -17099,6 +17844,819 @@
              state ? &state->ID3D12PipelineState_iface : NULL);
  }
  
@@ -305,6 +1134,64 @@
 +    return names[r];
 +}
 +
++/* Why the bound pipeline could not ride a multi-draw. Same racy-by-design accounting as
++ * the reasons above - a torn counter costs a slightly wrong diagnostic. Without this the
++ * only visible signal was a single "last submission" blocks= value, which says nothing
++ * about the split across a frame. */
++enum vkd3d_dgc_multi_draw_veto
++{
++    VKD3D_DGC_MD_OK = 0,
++    VKD3D_DGC_MD_OFF,           /* turned off by configuration */
++    VKD3D_DGC_MD_NO_MULTIDRAW,  /* device cannot multi-draw indirect at all */
++    VKD3D_DGC_MD_LIMITS,        /* device limits left no room for even two blocks */
++    VKD3D_DGC_MD_NOT_GRAPHICS,
++    VKD3D_DGC_MD_META_INVALID,  /* a stage carries no root constant record */
++    VKD3D_DGC_MD_META_READS,    /* a stage reads per-command root constants unindexed */
++    VKD3D_DGC_MD_VETO_COUNT,
++};
++
++static uint32_t vkd3d_dgc_md_veto[VKD3D_DGC_MD_VETO_COUNT];
++
++static const char *vkd3d_dgc_multi_draw_veto_name(enum vkd3d_dgc_multi_draw_veto v)
++{
++    static const char *names[VKD3D_DGC_MD_VETO_COUNT] =
++    {
++        "ok", "off", "noMultiDraw", "limits", "notGfx", "metaInvalid", "metaReads",
++    };
++
++    return names[v];
++}
++
++/* Returns 0 so each exit in the gate below can both record and return in one line. */
++static uint32_t d3d12_dgc_multi_draw_veto(enum vkd3d_dgc_multi_draw_veto v)
++{
++    vkd3d_dgc_md_veto[v]++;
++    return 0;
++}
++
++/* Host-side kill switch for the multi-draw collapse, deliberately NOT folded into
++ * vkd3d_compute_shader_interface_key(). The SPIR-V is byte-identical either way: an
++ * indexed module reads blocks[DrawIndex], and DrawIndex is 0 on a one-draw command, so
++ * the unroll path feeds it exactly the block it used to get. That makes this a pure
++ * host-path A/B with no shader recompile, which is the only affordable way to test a
++ * visual artifact against a five-minute cold compile.
++ *
++ * VKD3D_DGC_MULTI_DRAW_BLOCKS=0 is the deeper revert that also takes the array back out
++ * of the shaders, and that one does change the SPIR-V. */
++static bool d3d12_dgc_multi_draw_enabled(void)
++{
++    static int cached = -1;
++    char env[32];
++
++    if (cached < 0)
++    {
++        cached = vkd3d_get_env_var("VKD3D_DGC_MULTI_DRAW", env, sizeof(env))
++                ? strtoul(env, NULL, 0) != 0 : 1;
++    }
++
++    return cached != 0;
++}
++
 +/* Command-count distribution, so the bound above can be chosen from the shape of
 + * the workload rather than from its extremes. Bucket b holds calls whose
 + * max_command_count fell in [2^b, 2^(b+1)-1] and prints under the bucket's lower
@@ -312,6 +1199,39 @@
 + * whether the mass sits at 70 or at 20000 - and that is exactly the number needed
 + * to trade geometry correctness against recording time. */
 +#define VKD3D_DGC_EMULATE_BUCKETS 18u
++
++/* What the unroll actually cost in Vulkan calls, and the chunk size that produced it.
++ * The whole point of the multi-draw collapse is to move this number, so it has to be
++ * observable in a log rather than inferred from the command count. Two calls per chunk:
++ * one descriptor push and one draw. */
++static uint32_t vkd3d_dgc_emulate_vk_calls;
++static uint32_t vkd3d_dgc_emulate_blocks;
++
++static void d3d12_dgc_emulate_note_submission(uint32_t vk_calls, uint32_t blocks)
++{
++    vkd3d_dgc_emulate_vk_calls += vk_calls;
++    vkd3d_dgc_emulate_blocks = blocks;
++}
++
++/* Whether the unroll got a count buffer, and whether per-chunk counts were actually
++ * emitted for it. This is the one premise the count-draw fix rests on that the logs
++ * cannot confirm: if the engine calls ExecuteIndirect without a count buffer, there is
++ * nothing to trim and the emptiness has to come from the arguments instead. The total
++ * is uint64_t - unrolled_cmds above is uint32_t and already near 3.25e9. */
++static uint64_t vkd3d_dgc_emulate_count_cmds;
++static uint32_t vkd3d_dgc_emulate_count_calls;
++static uint32_t vkd3d_dgc_emulate_count_ready;
++
++static void d3d12_dgc_emulate_note_counts(uint32_t max_commands, bool has_count, bool ready)
++{
++    if (!has_count)
++        return;
++
++    vkd3d_dgc_emulate_count_calls++;
++    vkd3d_dgc_emulate_count_cmds += max_commands;
++    if (ready)
++        vkd3d_dgc_emulate_count_ready++;
++}
 +
 +static void d3d12_dgc_emulate_tally(uint32_t max_command_count,
 +        enum vkd3d_dgc_emulate_reason reason)
@@ -345,10 +1265,24 @@
 +
 +    if ((calls % 8192u) == 0u)
 +    {
-+        char reasons[256];
-+        char hist[256];
++        /* Initialised because a counter set that is entirely zero adds nothing below, and
++         * an uninitialised buffer would then print as garbage and cost a launch to work
++         * out. */
++        char reasons[256] = "";
++        char vetoes[256] = "";
++        char hist[256] = "";
++        char hoists[256] = "";
++        /* Twelve counters with eight-digit values now, so 256 no longer has slack. The loop
++         * below stops writing rather than overflowing, which would silently drop the
++         * rightmost counters - and those are the new ones the next decision rests on. */
++        char batches[384] = "";
++        char sites[256] = "";
 +        size_t off = 0;
++        size_t voff = 0;
 +        size_t hoff = 0;
++        size_t xoff = 0;
++        size_t boff = 0;
++        size_t soff = 0;
 +
 +        for (i = 0; i < VKD3D_DGC_EMULATE_REASON_COUNT; i++)
 +        {
@@ -356,6 +1290,30 @@
 +                continue;
 +            off += snprintf(reasons + off, sizeof(reasons) - off, "%s=%u ",
 +                    vkd3d_dgc_emulate_reason_name(i), by_reason[i]);
++        }
++
++        for (i = 0; i < VKD3D_DGC_MD_VETO_COUNT; i++)
++        {
++            if (!vkd3d_dgc_md_veto[i] || voff >= sizeof(vetoes) - 1)
++                continue;
++            voff += snprintf(vetoes + voff, sizeof(vetoes) - voff, "%s=%u ",
++                    vkd3d_dgc_multi_draw_veto_name(i), vkd3d_dgc_md_veto[i]);
++        }
++
++        for (i = 0; i < VKD3D_DGC_HOIST_COUNT; i++)
++        {
++            if (!vkd3d_dgc_hoist[i] || xoff >= sizeof(hoists) - 1)
++                continue;
++            xoff += snprintf(hoists + xoff, sizeof(hoists) - xoff, "%s=%u ",
++                    vkd3d_dgc_hoist_outcome_name(i), vkd3d_dgc_hoist[i]);
++        }
++
++        for (i = 0; i < VKD3D_EI_BATCH_COUNT; i++)
++        {
++            if (!vkd3d_ei_batch_stat[i] || boff >= sizeof(batches) - 1)
++                continue;
++            boff += snprintf(batches + boff, sizeof(batches) - boff, "%s=%u ",
++                    vkd3d_ei_batch_stat_name(i), vkd3d_ei_batch_stat[i]);
 +        }
 +
 +        for (i = 0; i < VKD3D_DGC_EMULATE_BUCKETS; i++)
@@ -366,10 +1324,138 @@
 +                    1u << i, buckets[i]);
 +        }
 +
-+        ERR("DGC emulate: bound=%u calls=%u cmds=%u (biggest %u) rejectRange %u..%u | %s| hist %s\n",
-+                d3d12_dgc_emulate_max_commands(), calls, unrolled_cmds, biggest_unrolled,
-+                rejected_min, rejected_max, reasons, hist);
++        /* The flush sites that produced the most single-entry batches, worst first. Those are
++         * the ones worth attacking: a singleton batch pays a full drain and saves nothing, so
++         * whichever command sits between the engine's consecutive ExecuteIndirects is where
++         * the rest of the win is. Printed as line:flushes/singletons/avgEntries. */
++        {
++            uint32_t printed, best, j;
++            bool taken[VKD3D_EI_FLUSH_SITE_MAX] = { false };
++
++            for (printed = 0; printed < 6; printed++)
++            {
++                best = VKD3D_EI_FLUSH_SITE_MAX;
++                for (j = 0; j < vkd3d_ei_flush_site_count; j++)
++                {
++                    if (taken[j] || !vkd3d_ei_flush_site[j].flushes)
++                        continue;
++                    if (best == VKD3D_EI_FLUSH_SITE_MAX ||
++                            vkd3d_ei_flush_site[j].singletons > vkd3d_ei_flush_site[best].singletons)
++                        best = j;
++                }
++
++                if (best == VKD3D_EI_FLUSH_SITE_MAX || soff >= sizeof(sites) - 1)
++                    break;
++
++                taken[best] = true;
++                soff += snprintf(sites + soff, sizeof(sites) - soff, "L%u:%u/%u/%.1f ",
++                        vkd3d_ei_flush_site[best].site,
++                        vkd3d_ei_flush_site[best].flushes,
++                        vkd3d_ei_flush_site[best].singletons,
++                        (double)vkd3d_ei_flush_site[best].entries /
++                                (double)vkd3d_ei_flush_site[best].flushes);
++            }
++        }
++
++        ERR("DGC emulate: bound=%u blocks=%u calls=%u cmds=%u vkCalls=%u (biggest %u) "
++                "rejectRange %u..%u | cnt calls=%u cmds=%"PRIu64" ready=%u "
++                "| %s| md %s| hoist %s| batch %s| sites %s| hist %s\n",
++                d3d12_dgc_emulate_max_commands(), vkd3d_dgc_emulate_blocks, calls,
++                unrolled_cmds, vkd3d_dgc_emulate_vk_calls, biggest_unrolled,
++                rejected_min, rejected_max,
++                vkd3d_dgc_emulate_count_calls, vkd3d_dgc_emulate_count_cmds,
++                vkd3d_dgc_emulate_count_ready,
++                reasons, vetoes, hoists, batches, sites, hist);
 +    }
++}
++
++/* The chunk size the device and the configuration allow, ignoring the bound pipeline.
++ *
++ * Split out because the patch pass and the draw pass have to agree on it. The patch pass
++ * writes one count per chunk and the draw pass reads them back by chunk index, so if the
++ * two ever computed a different chunk size the draws would read the wrong slots. In a
++ * batch replay the patch pass runs with list->state deliberately not set to the entry's
++ * pipeline - see the SetPipelineState guard in d3d12_command_list_flush_dgc_batch_at - so
++ * anything that reads list->state cannot be asked at patch time. This function reads no
++ * list state at all, which is exactly what makes it safe to ask from both passes. */
++static uint32_t d3d12_dgc_emulate_multi_draw_blocks_limit(struct d3d12_device *device)
++{
++    const VkPhysicalDeviceLimits *limits;
++    uint32_t blocks;
++
++    blocks = vkd3d_shader_root_constant_draw_index_blocks();
++    if (blocks <= 1 || !d3d12_dgc_multi_draw_enabled())
++        return 0;
++
++    if (!device->device_info.features2.features.multiDrawIndirect)
++        return 0;
++
++    limits = &device->device_info.properties2.properties.limits;
++
++    /* One window has to address the whole chunk, and one multi-draw has to be allowed to
++     * cover it. Clamped rather than refused: the SPIR-V array is sized by the configured
++     * value, and a chunk smaller than that array only ever indexes blocks that exist, so
++     * a tight device limit costs some of the collapse instead of all of it. Refusing here
++     * would silently put a whole frame back on the one-draw-per-command path. */
++    while (blocks > 1 && blocks * sizeof(union vkd3d_root_parameter_data) > limits->maxUniformBufferRange)
++        blocks /= 2;
++
++    if (blocks > limits->maxDrawIndirectCount)
++        blocks = limits->maxDrawIndirectCount;
++
++    return blocks > 1 ? blocks : 0;
++}
++
++/* Chunk size for folding the unroll below into multi-draws, or 0 when the bound
++ * pipeline has to keep one draw per command.
++ *
++ * Every graphics stage has to be happy with it. A stage that reads per-command root
++ * constants can only ride a multi-draw if its root parameter block was emitted as a
++ * DrawIndex-indexed array, and DrawIndex only exists in Vertex, Task and Mesh - so a
++ * pixel shader that reads root constants vetoes the whole pipeline. So does any stage
++ * whose meta predates these flags, because a module deserialized from a cache written
++ * under a different setting carries no record either way and must not be assumed safe.
++ * The shader cache key includes the block count precisely so that cannot happen, but
++ * checking is free and the failure it prevents is silently wrong geometry.
++ *
++ * Returns either 0 or exactly d3d12_dgc_emulate_multi_draw_blocks_limit(), never some
++ * third value - the per-chunk draw counts depend on that. */
++static uint32_t d3d12_dgc_emulate_multi_draw_blocks(struct d3d12_command_list *list)
++{
++    const struct d3d12_graphics_pipeline_state *graphics;
++    uint32_t blocks;
++    size_t i;
++
++    if (vkd3d_shader_root_constant_draw_index_blocks() <= 1 || !d3d12_dgc_multi_draw_enabled())
++        return d3d12_dgc_multi_draw_veto(VKD3D_DGC_MD_OFF);
++
++    if (!list->device->device_info.features2.features.multiDrawIndirect)
++        return d3d12_dgc_multi_draw_veto(VKD3D_DGC_MD_NO_MULTIDRAW);
++
++    blocks = d3d12_dgc_emulate_multi_draw_blocks_limit(list->device);
++
++    if (blocks <= 1)
++        return d3d12_dgc_multi_draw_veto(VKD3D_DGC_MD_LIMITS);
++
++    if (!list->state || !d3d12_pipeline_state_is_graphics(list->state))
++        return d3d12_dgc_multi_draw_veto(VKD3D_DGC_MD_NOT_GRAPHICS);
++
++    graphics = &list->state->graphics;
++
++    for (i = 0; i < graphics->stage_count; i++)
++    {
++        uint32_t flags = graphics->code[i].meta.flags;
++
++        if (!(flags & VKD3D_SHADER_META_FLAG_ROOT_CONSTANT_INFO_VALID))
++            return d3d12_dgc_multi_draw_veto(VKD3D_DGC_MD_META_INVALID);
++
++        if ((flags & VKD3D_SHADER_META_FLAG_READS_ROOT_CONSTANTS) &&
++                !(flags & VKD3D_SHADER_META_FLAG_ROOT_CONSTANTS_DRAW_INDEXED))
++            return d3d12_dgc_multi_draw_veto(VKD3D_DGC_MD_META_READS);
++    }
++
++    vkd3d_dgc_md_veto[VKD3D_DGC_MD_OK]++;
++    return blocks;
 +}
 +
 +/* Applies the per-command root constants of a CONSTANT + DRAW[_INDEXED] command
@@ -379,12 +1465,21 @@
 + * is outside what this can express, leaving the caller to fall back.
 + *
 + * arg_buffer_offset_command is the offset of the start of command 0, i.e. of the
-+ * root arguments, not of the draw argument that follows them. */
++ * root arguments, not of the draw argument that follows them.
++ *
++ * mode selects which half of the work to record; see enum vkd3d_ei_emulate_mode.
++ * In VKD3D_EI_EMULATE_TRY_DEFER - which only the application's ExecuteIndirect passes -
++ * the call may instead be deferred into the command list's batch and replayed later in
++ * two passes, which is what stops each call paying its own render pass break and
++ * compute-to-graphics drain; if it is not eligible the mode behaves as ALL. batch_entry
++ * is the entry being filled in or replayed, and is only read or written for the batched
++ * modes. */
 +static bool d3d12_command_list_execute_indirect_emulate_root_constants(
-+        struct d3d12_command_list *list, const struct d3d12_command_signature *sig_impl,
++        struct d3d12_command_list *list, struct d3d12_command_signature *sig_impl,
 +        uint32_t max_command_count,
 +        struct d3d12_resource *arg_impl, uint64_t arg_buffer_offset_command,
-+        struct d3d12_resource *count_impl, uint64_t count_buffer_offset)
++        struct d3d12_resource *count_impl, uint64_t count_buffer_offset,
++        enum vkd3d_ei_emulate_mode mode, struct vkd3d_dgc_batch_draw *batch_entry)
 +{
 +    const D3D12_COMMAND_SIGNATURE_DESC *signature_desc = &sig_impl->desc;
 +    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
@@ -395,6 +1490,7 @@
 +    const D3D12_INDIRECT_ARGUMENT_DESC *cdesc;
 +    struct vkd3d_scratch_allocation args_scratch;
 +    struct vkd3d_scratch_allocation root_scratch;
++    struct vkd3d_scratch_allocation counts_scratch;
 +    struct vkd3d_scratch_allocation block;
 +    uint32_t action_words, action_word_offset;
 +    uint32_t constant_dest_word, constant_words;
@@ -403,6 +1499,8 @@
 +    VkDescriptorBufferInfo buffer_info;
 +    VkWriteDescriptorSet write;
 +    uint32_t root_block_size;
++    uint32_t chunk_blocks;
++    bool patch_inline;
 +    bool indexed;
 +    uint32_t i;
 +
@@ -489,19 +1587,114 @@
 +        return false;
 +    }
 +
-+    if (!d3d12_command_list_emit_unroll_draw_indirect(list,
-+            arg_impl->res.va + arg_buffer_offset_command,
-+            count_impl ? count_impl->res.va + count_buffer_offset : 0,
-+            signature_desc->ByteStride, max_command_count,
-+            action_word_offset, action_words,
-+            constant_dest_word, constant_words,
-+            &args_scratch, &root_scratch))
++    if (mode == VKD3D_EI_EMULATE_DRAW)
 +    {
-+        d3d12_dgc_emulate_tally(max_command_count, VKD3D_DGC_EMULATE_EMIT_FAILED);
-+        return false;
++        /* The dispatch that filled these ran in the batch's first pass, with one barrier
++         * after the last of them, so everything below can read them as written. */
++        args_scratch = batch_entry->emulate_args_scratch;
++        root_scratch = batch_entry->emulate_root_scratch;
++        counts_scratch = batch_entry->emulate_counts_scratch;
 +    }
++    else
++    {
++        /* Defer instead of recording, so a run of consecutive ExecuteIndirect calls can put
++         * all its dispatches first and all its draws afterwards, and pay one drain for the
++         * run instead of one per call. Every command that could observe the draws - any
++         * direct draw or dispatch, any barrier, copy, clear, query or render target change -
++         * flushes the batch before it does anything, so deferring cannot reorder the draws
++         * against anything that can tell. The state setters that do not flush are exactly
++         * the ones whose effect is captured in the entry and restored on replay.
++         *
++         * Not attempted while predication is armed: the predicate would have to be
++         * re-established per entry on replay, and predication on this path is rare enough
++         * that the complexity is not worth it. A compute pipeline cannot be here either -
++         * the entry's state is dereferenced as a graphics pipeline on replay.
++         *
++         * TRY_DEFER and not ALL: only the application's own call may defer. See the comment
++         * on the mode enum for why replaying a deferral is a hang rather than a no-op. */
++        if (mode == VKD3D_EI_EMULATE_TRY_DEFER && d3d12_dgc_emulate_batch_enabled() &&
++                !list->predication.va && list->state &&
++                list->state->pipeline_type != VKD3D_PIPELINE_TYPE_COMPUTE)
++        {
++            struct vkd3d_dgc_batch_draw *entry;
 +
-+    d3d12_dgc_emulate_tally(max_command_count, VKD3D_DGC_EMULATE_OK);
++            vkd3d_array_reserve((void **)&list->dgc_batch.draws, &list->dgc_batch.draws_size,
++                    list->dgc_batch.draws_count + 1, sizeof(*list->dgc_batch.draws));
++            entry = &list->dgc_batch.draws[list->dgc_batch.draws_count++];
++
++            memset(entry, 0, sizeof(*entry));
++            entry->emulate = true;
++            entry->signature = sig_impl;
++            entry->max_command_count = max_command_count;
++            entry->arg_buffer = arg_impl;
++            entry->arg_buffer_offset = arg_buffer_offset_command;
++            entry->count_buffer = count_impl;
++            entry->count_buffer_offset = count_buffer_offset;
++            entry->state = list->state;
++            entry->dynamic_state = list->dynamic_state;
++            entry->graphics_bindings = list->graphics_bindings;
++            entry->index_buffer = list->index_buffer;
++
++            vkd3d_ei_batch_stat[VKD3D_EI_BATCH_DEFERRED]++;
++
++            /* Cap how far the batch may grow. vkd3d_dgc_batch_draw is around 5 KB - it
++             * carries a whole dynamic state block and a whole root parameter binding block -
++             * and vkd3d_array_reserve never gives the memory back, so an uncapped batch sets
++             * a high water mark per command list that the list then keeps. The saving being
++             * bought here is one pipeline drain per batch instead of one per call, and by a
++             * few hundred entries that is already a two-order-of-magnitude cut; letting the
++             * batch run to thousands would buy a rounding error and cost megabytes per list.
++             * Flushing at the cap keeps the win and bounds the footprint. */
++            if (list->dgc_batch.draws_count >= VKD3D_EI_EMULATE_BATCH_MAX)
++            {
++                vkd3d_ei_batch_stat[VKD3D_EI_BATCH_CAPPED]++;
++                d3d12_command_list_flush_dgc_batch(list);
++            }
++
++            return true;
++        }
++
++        vkd3d_ei_batch_stat[VKD3D_EI_BATCH_INLINE]++;
++
++        /* The chunk size the draws below will use, asked of the device rather than of the
++         * bound pipeline so the patch pass and the draw pass cannot disagree. A pipeline
++         * veto only ever turns the chunking off, and that case falls back to fixed-count
++         * draws which ignore the counts entirely, so over-writing them costs a few words
++         * of scratch and nothing else. */
++        chunk_blocks = d3d12_dgc_emulate_multi_draw_blocks_limit(list->device);
++
++        if (!d3d12_command_list_emit_unroll_draw_indirect(list,
++                arg_impl->res.va + arg_buffer_offset_command,
++                count_impl ? count_impl->res.va + count_buffer_offset : 0,
++                signature_desc->ByteStride, max_command_count,
++                action_word_offset, action_words,
++                constant_dest_word, constant_words, chunk_blocks,
++                &args_scratch, &root_scratch, &counts_scratch,
++                mode == VKD3D_EI_EMULATE_PATCH, &patch_inline))
++        {
++            d3d12_dgc_emulate_tally(max_command_count, VKD3D_DGC_EMULATE_EMIT_FAILED);
++            return false;
++        }
++
++        d3d12_dgc_emulate_tally(max_command_count, VKD3D_DGC_EMULATE_OK);
++        d3d12_dgc_emulate_note_counts(max_command_count, count_impl != NULL,
++                counts_scratch.buffer != VK_NULL_HANDLE);
++
++        if (mode == VKD3D_EI_EMULATE_PATCH)
++        {
++            /* Hand the scratch to the draw pass. The allocations come from the command
++             * allocator and are only recycled when it is reset, so they stay valid for the
++             * rest of the command list - there is nothing to keep alive here beyond the
++             * addresses themselves. */
++            batch_entry->emulate_args_scratch = args_scratch;
++            batch_entry->emulate_root_scratch = root_scratch;
++            batch_entry->emulate_counts_scratch = counts_scratch;
++            batch_entry->emulate_indexed = indexed;
++            batch_entry->emulate_action_words = action_words;
++            batch_entry->emulate_patch_inline = patch_inline;
++            return true;
++        }
++    }
 +
 +    /* From here on the draws are ours to issue: the fallback path would double
 +     * draw, so every exit below reports success. */
@@ -523,7 +1716,87 @@
 +    root_block_size = sizeof(union vkd3d_root_parameter_data);
 +    block = root_scratch;
 +
-+    for (i = 0; i < max_command_count; i++)
++    /* Chunked: one descriptor push and one multi-draw per chunk. The shaders read their
++     * command's root parameter block by DrawIndex, which the multi-draw numbers from 0
++     * within each chunk, so binding the window at the chunk's first block lines the two
++     * up. The compute pass wrote the draw arguments tightly packed, so the multi-draw
++     * stride is just the size of one argument struct. */
++    chunk_blocks = d3d12_dgc_emulate_multi_draw_blocks(list);
++
++    if (chunk_blocks > 1)
++    {
++        /* Whether the patch pass wrote per-chunk draw counts for exactly this chunk size.
++         * The equality is checked rather than assumed: the counts are indexed by chunk, so
++         * a mismatch would not merely lose the saving, it would read the wrong slot. The
++         * veto above can only return 0 or the limit, so this holds whenever the buffer is
++         * there - but a future veto that returned a third value would fail closed here
++         * instead of drawing the wrong thing. */
++        bool count_draw = counts_scratch.buffer != VK_NULL_HANDLE &&
++                chunk_blocks == d3d12_dgc_emulate_multi_draw_blocks_limit(list->device);
++        uint32_t vk_calls = 0;
++
++        for (i = 0; i < max_command_count; i += chunk_blocks)
++        {
++            uint32_t chunk = min(chunk_blocks, max_command_count - i);
++
++            block.buffer = root_scratch.buffer;
++            block.offset = root_scratch.offset + (VkDeviceSize)i * root_block_size;
++
++            /* The range covers only the blocks this chunk will actually index, so the
++             * last, partial chunk cannot read past the end of the scratch allocation. */
++            vk_write_descriptor_set_from_scratch_push_ubo(&write, &buffer_info, &block,
++                    chunk * root_block_size, rs->push_constant_ubo_binding.binding);
++
++            VK_CALL(vkCmdPushDescriptorSetKHR(list->cmd.vk_command_buffer,
++                    VK_PIPELINE_BIND_POINT_GRAPHICS, bind_point_layout->vk_pipeline_layout,
++                    rs->root_descriptor_set, 1, &write));
++
++            if (count_draw)
++            {
++                /* chunk is the maximum, and the count the patch pass wrote is how many of
++                 * those the count buffer named - so a chunk entirely past the real count
++                 * fetches nothing at all instead of retiring hundreds of empty packets.
++                 * DrawIndex still numbers from 0 within the command, and the count is the
++                 * fetched value, so blocks[DrawIndex] lines up exactly as before. */
++                VkDeviceSize count_offset = counts_scratch.offset +
++                        (VkDeviceSize)(i / chunk_blocks) * sizeof(uint32_t);
++
++                if (indexed)
++                {
++                    VK_CALL(vkCmdDrawIndexedIndirectCount(list->cmd.vk_command_buffer,
++                            args_scratch.buffer,
++                            args_scratch.offset + (VkDeviceSize)i * action_words * sizeof(uint32_t),
++                            counts_scratch.buffer, count_offset,
++                            chunk, action_words * sizeof(uint32_t)));
++                }
++                else
++                {
++                    VK_CALL(vkCmdDrawIndirectCount(list->cmd.vk_command_buffer,
++                            args_scratch.buffer,
++                            args_scratch.offset + (VkDeviceSize)i * action_words * sizeof(uint32_t),
++                            counts_scratch.buffer, count_offset,
++                            chunk, action_words * sizeof(uint32_t)));
++                }
++            }
++            else if (indexed)
++            {
++                VK_CALL(vkCmdDrawIndexedIndirect(list->cmd.vk_command_buffer, args_scratch.buffer,
++                        args_scratch.offset + (VkDeviceSize)i * action_words * sizeof(uint32_t),
++                        chunk, action_words * sizeof(uint32_t)));
++            }
++            else
++            {
++                VK_CALL(vkCmdDrawIndirect(list->cmd.vk_command_buffer, args_scratch.buffer,
++                        args_scratch.offset + (VkDeviceSize)i * action_words * sizeof(uint32_t),
++                        chunk, action_words * sizeof(uint32_t)));
++            }
++
++            vk_calls += 2;
++        }
++
++        d3d12_dgc_emulate_note_submission(vk_calls, chunk_blocks);
++    }
++    else for (i = 0; i < max_command_count; i++)
 +    {
 +        block.buffer = root_scratch.buffer;
 +        block.offset = root_scratch.offset + (VkDeviceSize)i * root_block_size;
@@ -549,6 +1822,9 @@
 +        }
 +    }
 +
++    if (chunk_blocks <= 1)
++        d3d12_dgc_emulate_note_submission(2u * max_command_count, 0);
++
 +    /* The push UBO now holds command N-1's constants, not the API's, so make the
 +     * next draw re-emit the root parameter block. */
 +    d3d12_command_list_invalidate_root_parameters(list, &list->graphics_bindings, false, NULL);
@@ -559,9 +1835,21 @@
  static void STDMETHODCALLTYPE d3d12_command_list_ExecuteIndirect(d3d12_command_list_iface *iface,
          ID3D12CommandSignature *command_signature, UINT max_command_count, ID3D12Resource *arg_buffer,
          UINT64 arg_buffer_offset, ID3D12Resource *count_buffer, UINT64 count_buffer_offset)
-@@ -17153,13 +17644,75 @@
+@@ -17151,17 +18709,96 @@
+         return;
+     }
  
-     d3d12_command_list_flush_dgc_batch(list);
+-    d3d12_command_list_flush_dgc_batch(list);
++    /* Deliberately NOT flushing the batch here. Upstream does, because on its path every
++     * call below records immediately and the batch has to be drained first to keep the
++     * order. Here the whole point is that a run of these calls accumulates into the batch,
++     * and flushing on entry would empty it on every single call - the batch would never
++     * hold more than one entry and the change would do nothing at all.
++     *
++     * Everything between here and the emulation attempt is pure computation: offsets,
++     * a scan of the argument descriptors, and a debug label. The flush is moved to just
++     * before the first thing that actually records, which is the fallback path below, and
++     * the emulation path flushes on its own terms from d3d12_command_list_flush_dgc_batch. */
  
 -    /* Temporary workaround, since we cannot parse non-draw arguments yet. Point directly
 -     * to the first argument. Should avoid hard crashes for now. */
@@ -613,6 +1901,7 @@
 +        {
 +            FIXME_ONCE("Skipping indirect draw: signature carries per-command bindings "
 +                    "that cannot be emulated without device generated commands.\n");
++            d3d12_command_list_flush_dgc_batch(list);
 +            d3d12_command_list_debug_mark_label(list, "DGC skip", 1.0f, 0.0f, 0.0f, 1.0f);
 +            return;
 +        }
@@ -627,18 +1916,183 @@
 +                d3d12_command_list_execute_indirect_emulate_root_constants(list, sig_impl,
 +                        max_command_count, arg_impl,
 +                        arg_buffer_offset - sig_impl->argument_buffer_offset_for_command,
-+                        count_impl, count_buffer_offset))
++                        count_impl, count_buffer_offset, VKD3D_EI_EMULATE_TRY_DEFER, NULL))
 +        {
 +            return;
 +        }
 +
 +        FIXME_ONCE("Device generated commands unavailable: issuing indirect draws without "
 +                "their per-command root constants.\n");
++        d3d12_command_list_flush_dgc_batch(list);
 +        d3d12_command_list_debug_mark_label(list, "DGC emulate: root constants ignored",
 +                1.0f, 0.5f, 0.0f, 1.0f);
      }
  
++    /* The fallback path from here on records straight away, so anything the batch is
++     * still holding has to reach the command buffer first. A no-op when the batch is
++     * empty, which on the emulated path it is - the emulation either took the call or
++     * flushed on its way to refusing it. */
++    d3d12_command_list_flush_dgc_batch(list);
++
      if (list->predication.fallback_enabled)
+     {
+         union vkd3d_predicate_command_direct_args args;
+@@ -20709,6 +22346,9 @@
+     {
+         d3d12_command_list_debug_mark_label(list, "Indirect Argument barrier", 1.0f, 1.0f, 0.0f, 1.0f);
+         /* Any indirect patching commands now have to go to normal command buffer, unless we split the sequence. */
++        /* As in the legacy barrier path: counted only on a real re-alias. */
++        if (list->cmd.vk_post_indirect_barrier_commands != list->cmd.vk_command_buffer)
++            vkd3d_dgc_hoist[VKD3D_DGC_HOIST_REALIAS]++;
+         list->cmd.vk_post_indirect_barrier_commands = list->cmd.vk_command_buffer;
+         list->cmd.observes_indirect_argument_barrier = true;
+     }
+@@ -20952,6 +22592,123 @@
+     return true;
+ }
+ 
++/* Whether a pending emulated-ExecuteIndirect batch may stay deferred across this barrier
++ * group instead of being replayed before it.
++ *
++ * Why this exists: d3d12_command_list_Barrier flushed the batch unconditionally, and this
++ * engine puts a barrier between nearly every pair of ExecuteIndirects. Measured over one
++ * launch, this one call site produced 224607 of the 329696 single-entry batches, and a
++ * single-entry batch pays a full pipeline drain - end the render pass, then a
++ * COMPUTE_SHADER -> DRAW_INDIRECT|ALL_GRAPHICS barrier - while saving nothing, because there
++ * is no second entry to amortise it over. 68% of every drain left after batching is this
++ * flush. Nothing else in the tally comes close.
++ *
++ * Why deferring past a barrier can be legal at all: a deferred entry is a graphics draw, and
++ * leaving it deferred moves it *after* the barrier. Moving a read later is harmless, since a
++ * barrier only ever makes more writes visible, never fewer. The one thing that breaks is
++ * moving a write out of the barrier's source scope, because then whatever the barrier was
++ * published for stops seeing that write. SyncBefore *is* that source scope, expressed as
++ * stages - so if SyncBefore names no stage a draw executes in, the deferred draws cannot be
++ * what this barrier is publishing, and moving them past it is unobservable.
++ *
++ * Hence a whitelist rather than a blacklist. COMPUTE_SHADING and COPY are the only two
++ * source scopes that provably cannot contain a graphics draw. ALL, DRAW, INDEX_INPUT,
++ * VERTEX_SHADING, PIXEL_SHADING, DEPTH_STENCIL, RENDER_TARGET, ALL_SHADING and
++ * NON_PIXEL_SHADING (which includes vertex shading) all can. EXECUTE_INDIRECT is an indirect
++ * argument read, which is precisely what a deferred entry does. The raytracing, resolve and
++ * video scopes are left out not because they are known unsafe but because their interaction
++ * with the RTAS and clear batches is not worth reasoning about for scopes this engine does
++ * not put a live batch in front of; they fall out as bxSync in the tally if it ever does.
++ *
++ * TEXTURE groups are refused outright regardless of SyncBefore: they carry layout
++ * transitions, and a deferred draw that renders to or samples a transitioned image would run
++ * against the wrong layout. No stage mask can rule that out, so it is not attempted.
++ *
++ * SPLIT is refused because a begin/end barrier pair is an ordering construct in its own
++ * right, and moving work across one half of one is outside what the argument above covers.
++ * A SyncBefore of SPLIT is already caught by the whitelist test; SyncAfter needs its own.
++ *
++ * The batch itself stays correct across the crossing for the reasons the two-pass replay
++ * already relies on: OMSetRenderTargets flushes, and SetDescriptorHeaps flushes whenever the
++ * bound heaps actually change - it elides only a re-bind of the heaps already bound - so the
++ * attachment set and heaps cannot change underneath a live batch, and each entry carries its
++ * own pipeline, dynamic state, bindings, index buffer and scratch allocations. */
++#define VKD3D_BARRIER_SYNC_NO_GRAPHICS_SOURCE \
++        (D3D12_BARRIER_SYNC_COMPUTE_SHADING | D3D12_BARRIER_SYNC_COPY)
++
++static bool d3d12_command_list_barrier_allows_dgc_defer(struct d3d12_command_list *list,
++        UINT32 NumBarrierGroups, const D3D12_BARRIER_GROUP *pBarrierGroups)
++{
++    const D3D12_GLOBAL_BARRIER *global_barriers;
++    const D3D12_BUFFER_BARRIER *buffer_barriers;
++    unsigned int i, j, count;
++
++    /* An empty batch has nothing to reorder, so say yes without touching the counters:
++     * those exist to measure the predicate, and a barrier that arrived with no batch pending
++     * says nothing about it either way. The caller's flush would be a no-op regardless. */
++    if (!list->dgc_batch.draws_count)
++        return true;
++
++    if (!d3d12_dgc_barrier_defer_enabled())
++    {
++        vkd3d_ei_batch_stat[VKD3D_EI_BATCH_BXOTHER]++;
++        return false;
++    }
++
++    for (i = 0; i < NumBarrierGroups; i++)
++    {
++        count = pBarrierGroups[i].NumBarriers;
++
++        switch (pBarrierGroups[i].Type)
++        {
++            case D3D12_BARRIER_TYPE_GLOBAL:
++                global_barriers = pBarrierGroups[i].pGlobalBarriers;
++                for (j = 0; j < count; j++)
++                {
++                    if (global_barriers[j].SyncBefore & ~VKD3D_BARRIER_SYNC_NO_GRAPHICS_SOURCE)
++                    {
++                        vkd3d_ei_batch_stat[VKD3D_EI_BATCH_BXSYNC]++;
++                        return false;
++                    }
++                    if (global_barriers[j].SyncAfter == D3D12_BARRIER_SYNC_SPLIT)
++                    {
++                        vkd3d_ei_batch_stat[VKD3D_EI_BATCH_BXOTHER]++;
++                        return false;
++                    }
++                }
++                break;
++
++            case D3D12_BARRIER_TYPE_BUFFER:
++                buffer_barriers = pBarrierGroups[i].pBufferBarriers;
++                for (j = 0; j < count; j++)
++                {
++                    if (buffer_barriers[j].SyncBefore & ~VKD3D_BARRIER_SYNC_NO_GRAPHICS_SOURCE)
++                    {
++                        vkd3d_ei_batch_stat[VKD3D_EI_BATCH_BXSYNC]++;
++                        return false;
++                    }
++                    if (buffer_barriers[j].SyncAfter == D3D12_BARRIER_SYNC_SPLIT)
++                    {
++                        vkd3d_ei_batch_stat[VKD3D_EI_BATCH_BXOTHER]++;
++                        return false;
++                    }
++                }
++                break;
++
++            case D3D12_BARRIER_TYPE_TEXTURE:
++                vkd3d_ei_batch_stat[VKD3D_EI_BATCH_BXTEX]++;
++                return false;
++
++            default:
++                vkd3d_ei_batch_stat[VKD3D_EI_BATCH_BXOTHER]++;
++                return false;
++        }
++    }
++
++    vkd3d_ei_batch_stat[VKD3D_EI_BATCH_BXOK]++;
++    return true;
++}
++
+ static void STDMETHODCALLTYPE d3d12_command_list_Barrier(d3d12_command_list_iface *iface, UINT32 NumBarrierGroups, const D3D12_BARRIER_GROUP *pBarrierGroups)
+ {
+     struct d3d12_command_list *list = impl_from_ID3D12GraphicsCommandList(iface);
+@@ -20970,7 +22727,8 @@
+         return;
+     }
+ 
+-    d3d12_command_list_flush_dgc_batch(list);
++    if (!d3d12_command_list_barrier_allows_dgc_defer(list, NumBarrierGroups, pBarrierGroups))
++        d3d12_command_list_flush_dgc_batch(list);
+     d3d12_command_list_end_current_render_pass(list, false);
+     d3d12_command_list_end_transfer_batch(list);
+     d3d12_command_list_barrier_batch_init(&batch);
+@@ -21284,6 +23042,11 @@
+ 
+     memset(list, 0, sizeof(*list));
+ 
++    /* A created command list is already in the recording state, so it can be recorded into
++     * without a Reset first. Zero would be a heap_count an application may legally pass, so
++     * the redundant-bind cache has to start invalid here as well, not only in reset. */
++    list->applied_descriptor_heap_count = VKD3D_APPLIED_HEAPS_UNKNOWN;
++
+ #ifdef VKD3D_ENABLE_PROFILING
+     if (vkd3d_uses_profiling())
+         list->ID3D12GraphicsCommandList_iface.lpVtbl = &d3d12_command_list_vtbl_profiled;
 --- a/libs/vkd3d/device.c
 +++ b/libs/vkd3d/device.c
 @@ -982,7 +982,13 @@
@@ -702,6 +2156,39 @@
      /* If we're faking VRS tier 1, we need to just nop out everything about primitive shading rate. */
      if ((vkd3d_application_feature_override & VKD3D_APPLICATION_FEATURE_RDNA1_COMPATIBILITY) &&
          device->device_info.properties2.properties.vendorID == VKD3D_VENDOR_ID_AMD &&
+@@ -10331,6 +10356,22 @@
+      * but it is useful to be able to modify the internal revision while developing since
+      * we have no mechanism for emitting dirty Git revisions. */
+     key = hash_fnv1_iterate_u64(key, vkd3d_shader_get_revision());
++    /* Changes the layout of the root constant block itself, so every cached SPIR-V
++     * module and every cached shader meta record from a different setting has to be
++     * rejected. Folding it in here is what makes flipping the setting safe: without it,
++     * a stale pixel shader would come back with no record of whether it reads root
++     * constants and the command list would wrongly fold it into a multi-draw. */
++    key = hash_fnv1_iterate_u32(key, vkd3d_shader_root_constant_draw_index_blocks());
++    /* The meaning of VKD3D_SHADER_META_FLAG_READS_ROOT_CONSTANTS, bumped whenever it
++     * changes. The block count above cannot cover this on its own: a refinement that
++     * leaves the emitted SPIR-V byte-identical and only narrows which reads get recorded
++     * produces the same key, so cached meta would come back carrying the old meaning and
++     * the gate would keep acting on it.
++     *
++     * 2: only a read of the application's own root constants counts. 1 counted every
++     * read, including invariant bindless table offsets, which vetoed essentially every
++     * pipeline in a bindless engine. */
++    key = hash_fnv1_iterate_u32(key, 2u);
+     key = hash_fnv1_iterate_u32(key, device->device_info.vulkan_1_3_properties.minSubgroupSize);
+     key = hash_fnv1_iterate_u32(key, device->device_info.vulkan_1_3_properties.maxSubgroupSize);
+     key = hash_fnv1_iterate_u32(key, device->bindless_state.flags);
+--- a/libs/vkd3d/meson.build
++++ b/libs/vkd3d/meson.build
+@@ -35,6 +35,7 @@
+   'shaders/cs_execute_indirect_patch.comp',
+   'shaders/cs_execute_indirect_patch_debug_ring.comp',
+   'shaders/cs_execute_indirect_multi_dispatch.comp',
++  'shaders/cs_execute_indirect_unroll_draw.comp',
+ 
+   'shaders/cs_sampler_feedback_decode_buffer_min_mip.comp',
+   'shaders/fs_sampler_feedback_decode_image_min_mip.frag',
 --- a/libs/vkd3d/meta.c
 +++ b/libs/vkd3d/meta.c
 @@ -1563,6 +1563,51 @@
@@ -999,7 +2486,119 @@
  ULONG d3d12_pipeline_library_inc_public_ref(struct d3d12_pipeline_library *state);
  ULONG d3d12_pipeline_library_dec_public_ref(struct d3d12_pipeline_library *state);
  void d3d12_pipeline_library_inc_ref(struct d3d12_pipeline_library *state);
-@@ -4754,6 +4770,37 @@
+@@ -3040,6 +3056,13 @@
+ {
+     bool need_compute_to_indirect_barrier;
+     bool need_compute_to_cbv_barrier;
++    /* As need_compute_to_cbv_barrier, but the uniform buffer is read by a draw's own
++     * graphics stages rather than by a compute dispatch. It needs its own flag because the
++     * other user of that one patches an indirect dispatch, so the barrier it asks for
++     * stops at COMPUTE_SHADER - which does not cover a vertex or pixel shader reading the
++     * root parameter block that ExecuteIndirect emulation just wrote. Widening the shared
++     * flag instead would silently over-synchronise the dispatch path. */
++    bool need_compute_to_graphics_cbv_barrier;
+     bool need_preprocess_barrier;
+ };
+ 
+@@ -3061,7 +3084,22 @@
+     VKD3D_COMMAND_BUFFER_SUBMIT_INFO_DEVICE_MASK_FALLBACK_QUEUE = 1u << 0,
+ };
+ 
+-#define VKD3D_MAX_COMMAND_LIST_SEQUENCES 2
++/* Upstream ships 2, which is one split per command list. That is enough for the reordering
++ * upstream wants, but not for what the ExecuteIndirect emulation path needs here: every
++ * transition to INDIRECT_ARGUMENT re-aliases the patch command buffer onto the main one, and
++ * only a split un-aliases it. A renderer that rebuilds indirect arguments once per pass
++ * therefore needs one split per pass, and with a budget of one it goes back to recording the
++ * patch dispatch inline - and paying a render pass break and a full compute-to-graphics
++ * drain - for the rest of the list.
++ *
++ * Raising this is safe because nothing assumes the value is 2. The submission loops are all
++ * "for (iter = 0; iter < iteration_count; iter++)"; the two iteration-indexed special cases
++ * in them mean "iteration 0" and "immediately after the first split", and stay correct at
++ * any budget. iterations[] is a fixed-size member, so the only cost is a little more of the
++ * command list struct. The real per-split cost is one more command buffer in the submission,
++ * which is why the emulation path spends the budget from an env-tunable allowance rather
++ * than splitting as often as this bound permits. */
++#define VKD3D_MAX_COMMAND_LIST_SEQUENCES 8
+ 
+ #define VKD3D_COMMAND_COST_LOW              (1u)
+ #define VKD3D_COMMAND_COST_HIGH             (16u)
+@@ -3183,6 +3221,34 @@
+ 
+     VkDeviceAddress preprocess_va;
+     VkDeviceSize preprocess_size;
++
++    /* Set when this entry is an ExecuteIndirect the root constant emulation took over,
++     * rather than a real device-generated-commands draw. On a device without DGC every
++     * entry is one of these, because the DGC path is never entered at all - see the
++     * requires_state_template early-out in command signature creation.
++     *
++     * Batching matters far more for these than it does for DGC. A DGC draw costs one
++     * vkCmdExecuteGeneratedCommands; an emulated one costs a compute dispatch that has to
++     * complete before the draw can read what it wrote, and on this path the dispatch
++     * almost always has to share the command buffer with the draw. That makes each call
++     * end the render pass and issue a full compute-to-graphics barrier: measured at
++     * 685335 render pass breaks in a single session, one per ExecuteIndirect, which is a
++     * complete GPU pipeline drain between consecutive draws of the same pass.
++     *
++     * Deferring lets every dispatch in a batch run back to back with the render pass
++     * already closed, then one barrier, then every draw - so a batch of N costs one drain
++     * instead of N. The scratch the dispatch writes has to survive from the dispatch pass
++     * to the draw pass, which is what the two allocations below are for; they come from
++     * the command allocator and so live as long as the command list either way. */
++    bool emulate;
++    bool emulate_indexed;
++    bool emulate_patch_inline;
++    uint32_t emulate_action_words;
++    struct vkd3d_scratch_allocation emulate_args_scratch;
++    struct vkd3d_scratch_allocation emulate_root_scratch;
++    /* Per-chunk draw counts the dispatch derives from the count buffer. buffer is null
++     * when the dispatch did not write them and the draws use a fixed count instead. */
++    struct vkd3d_scratch_allocation emulate_counts_scratch;
+ };
+ 
+ struct vkd3d_dgc_batch
+@@ -3192,6 +3258,12 @@
+     size_t draws_count;
+ };
+ 
++/* d3d12_command_list::applied_descriptor_heap_count when the bound heaps are not known to
++ * match anything the application could pass, so the next SetDescriptorHeaps must be applied
++ * in full. Used after a reset and for calls wider than D3D12 permits. It is deliberately a
++ * value no legal heap_count can take rather than a separate valid flag. */
++#define VKD3D_APPLIED_HEAPS_UNKNOWN (~0u)
++
+ struct d3d12_command_list
+ {
+     d3d12_command_list_iface ID3D12GraphicsCommandList_iface;
+@@ -3263,6 +3335,14 @@
+ 
+     union vkd3d_descriptor_heap_state descriptor_heap;
+ 
++    /* The heap objects the last SetDescriptorHeaps actually applied. A redundant re-bind of
++     * the same heaps can then be answered without flushing the deferred ExecuteIndirect
++     * batch, which is what makes it worth remembering: the flush is a GPU pipeline drain.
++     * D3D12 binds at most one CBV_SRV_UAV heap and one sampler heap, so two slots covers
++     * every legal call; a wider one sets the count to _UNKNOWN and takes the slow path. */
++    ID3D12DescriptorHeap *applied_descriptor_heaps[2];
++    unsigned int applied_descriptor_heap_count;
++
+     struct d3d12_pipeline_state *state;
+     struct d3d12_rt_state_object *rt_state;
+     D3D12_SET_WORK_GRAPH_DESC wg_state;
+@@ -3366,6 +3446,10 @@
+         struct vkd3d_pipeline_bindings *sibling_push_domain);
+ void d3d12_command_list_update_descriptor_buffers(struct d3d12_command_list *list);
+ void d3d12_command_list_flush_dgc_batch(struct d3d12_command_list *list);
++/* Same, plus the caller's source line, so the emulated-ExecuteIndirect tally can attribute
++ * batch flushes to the command that caused them. command.c macros the plain name onto this
++ * for its own 43 call sites; callers elsewhere use the plain name and report site 0. */
++void d3d12_command_list_flush_dgc_batch_at(struct d3d12_command_list *list, unsigned int site);
+ 
+ union vkd3d_root_parameter_data
+ {
+@@ -4754,6 +4838,44 @@
      VkPipeline vk_multi_dispatch_indirect_pipeline;
  };
  
@@ -1009,7 +2608,10 @@
 +    VkPipeline vk_pipeline;
 +};
 +
-+/* Mirrors the push constant block of cs_execute_indirect_unroll_draw.comp. */
++/* Mirrors the push constant block of cs_execute_indirect_unroll_draw.comp. Member order
++ * is part of that contract - the block is uploaded as one memcpy - so anything added here
++ * has to be added in the same place there. Currently 88 bytes against a 128 byte push
++ * constant budget. */
 +struct vkd3d_unroll_draw_indirect_args
 +{
 +    VkDeviceAddress indirect_va;
@@ -1017,6 +2619,8 @@
 +    VkDeviceAddress output_args_va;
 +    VkDeviceAddress root_template_va;
 +    VkDeviceAddress output_root_va;
++    /* One draw count per chunk of the unrolled multi-draw, or 0 to skip writing them. */
++    VkDeviceAddress output_count_va;
 +    uint32_t stride_words;
 +    uint32_t max_commands;
 +    uint32_t action_word_offset;
@@ -1026,6 +2630,8 @@
 +    uint32_t constant_dest_word;
 +    uint32_t constant_words;
 +    uint32_t has_count;
++    /* Chunk size the per-chunk counts are computed for; 0 disables them. */
++    uint32_t chunk_blocks;
 +};
 +
 +struct vkd3d_unroll_draw_indirect_ops
@@ -1037,7 +2643,7 @@
  struct vkd3d_execute_indirect_args
  {
      VkDeviceAddress template_va;
-@@ -4920,6 +4967,7 @@
+@@ -4920,6 +5042,7 @@
      struct vkd3d_predicate_ops predicate;
      struct vkd3d_execute_indirect_ops execute_indirect;
      struct vkd3d_multi_dispatch_indirect_ops multi_dispatch_indirect;
@@ -1045,7 +2651,7 @@
      struct vkd3d_dstorage_ops dstorage;
      struct vkd3d_sampler_feedback_resolve_ops sampler_feedback;
      struct vkd3d_workgraph_indirect_ops workgraph;
-@@ -4964,6 +5012,14 @@
+@@ -4964,6 +5087,14 @@
  {
      return 32;
  }
@@ -1070,6 +2676,56 @@
  #include <vs_fullscreen_layer.h>
  #include <vs_fullscreen.h>
  #include <gs_fullscreen.h>
+--- a/libs/vkd3d-shader/dxil.c
++++ b/libs/vkd3d-shader/dxil.c
+@@ -714,6 +714,21 @@
+             ERR("dxil-spirv does not support PUSH_CONSTANTS_AS_UNIFORM_BUFFER.\n");
+             return VKD3D_ERROR_NOT_IMPLEMENTED;
+         }
++
++        /* Only meaningful alongside the push UBO, since a push constant block cannot be
++         * rebased per draw. dxil-spirv decides per stage whether it can honour this:
++         * DrawIndex only exists in Vertex/Task/Mesh. */
++        if (vkd3d_shader_root_constant_draw_index_blocks() > 1)
++        {
++            const struct dxil_spv_option_root_constant_draw_index_blocks blocks_helper =
++                    { { DXIL_SPV_OPTION_ROOT_CONSTANT_DRAW_INDEX_BLOCKS },
++                            vkd3d_shader_root_constant_draw_index_blocks() };
++            if (dxil_spv_converter_add_option(converter, &blocks_helper.base) != DXIL_SPV_SUCCESS)
++            {
++                ERR("dxil-spirv does not support ROOT_CONSTANT_DRAW_INDEX_BLOCKS.\n");
++                return VKD3D_ERROR_NOT_IMPLEMENTED;
++            }
++        }
+     }
+ 
+     if (shader_interface_info->flags & VKD3D_SHADER_INTERFACE_BINDLESS_CBV_AS_STORAGE_BUFFER)
+@@ -1464,6 +1479,25 @@
+             &spirv->meta.cs_workgroup_size[2]);
+     dxil_spv_converter_get_patch_vertex_count(converter, &spirv->meta.patch_vertex_count);
+ 
++    {
++        dxil_spv_bool reads_root_constants = DXIL_SPV_FALSE;
++        dxil_spv_bool root_constants_draw_indexed = DXIL_SPV_FALSE;
++
++        dxil_spv_converter_get_root_constant_usage(converter,
++                &reads_root_constants, &root_constants_draw_indexed);
++
++        /* Recorded unconditionally, so that a shader coming back from a cache written
++         * before these flags existed is distinguishable from one that genuinely does not
++         * read root constants. Without that distinction a stale pixel shader would look
++         * safe to fold into a multi-draw and would then read the wrong command's
++         * constants. */
++        spirv->meta.flags |= VKD3D_SHADER_META_FLAG_ROOT_CONSTANT_INFO_VALID;
++        if (reads_root_constants)
++            spirv->meta.flags |= VKD3D_SHADER_META_FLAG_READS_ROOT_CONSTANTS;
++        if (root_constants_draw_indexed)
++            spirv->meta.flags |= VKD3D_SHADER_META_FLAG_ROOT_CONSTANTS_DRAW_INDEXED;
++    }
++
+     if (stage == DXIL_SPV_STAGE_HULL)
+     {
+         unsigned int offset;
 --- a/libs/vkd3d-shader/vkd3d_shader_main.c
 +++ b/libs/vkd3d-shader/vkd3d_shader_main.c
 @@ -22,6 +22,11 @@
@@ -1093,21 +2749,192 @@
      {
          if (fwrite(data, 1, size, f) != size)
              ERR("Failed to write shader to %s.\n", filename);
---- a/include/vkd3d_shader.h
-+++ b/include/vkd3d_shader.h
-@@ -548,6 +548,15 @@
- /* Use precise fma instead of the spec correct mad. To workaround issues with invariance. */
- #define VKD3D_SHADER_QUIRK_PRECISE_FMA (1ull << 33)
+@@ -534,6 +539,35 @@
+     return quirk_hash ^ 1;
+ }
  
-+/* dx12bridge marker (Crimson Desert / AMD Windows Polaris): when present in the
-+ * application's global_quirks, vkd3d_compile_shader_stage promotes min16float to
-+ * 32-bit for all NON-COMPUTE stages. AMD's Windows Vulkan compiler for Polaris
-+ * rejects graphics pipelines carrying Float16 SPIR-V with VK_ERROR_UNKNOWN (-13),
-+ * while FP16 compute compiles fine, so the device feature must stay enabled and
-+ * the demotion has to happen per-stage instead. Verified by live A/B 2026-08-10:
-+ * device-level FP16 off = 0 graphics failures but 5 compute E_INVALIDARG. */
-+#define VKD3D_SHADER_QUIRK_GFX_MIN16_AS_32BIT (1ull << 34)
++unsigned int vkd3d_shader_root_constant_draw_index_blocks(void)
++{
++    static int64_t cached = -1;
++    char env[32];
 +
- typedef uint64_t vkd3d_shader_quirks_t;
- 
- struct vkd3d_shader_quirk_hash
++    if (cached < 0)
++    {
++        unsigned long value = 0;
++
++        if (vkd3d_get_env_var("VKD3D_DGC_MULTI_DRAW_BLOCKS", env, sizeof(env)))
++            value = strtoul(env, NULL, 0);
++
++        /* Anything below two blocks cannot amortise anything, so it reads as off. The
++         * upper bound is what a single uniform buffer window can address: the host writes
++         * a full 64-DWORD root parameter block per command, so 256 blocks is exactly the
++         * 64 KiB that maxUniformBufferRange offers on this class of hardware. The command
++         * list re-checks against the real device limit before relying on it. */
++        if (value > 1)
++            cached = (int64_t)min(value, 256ul);
++        else
++            cached = 0;
++
++        if (cached)
++            INFO("Emitting root constants as %u DrawIndex-indexed blocks.\n", (unsigned int)cached);
++    }
++
++    return (unsigned int)cached;
++}
++
+ struct vkd3d_shader_stage_io_entry *vkd3d_shader_stage_io_map_append(struct vkd3d_shader_stage_io_map *map,
+         const char *semantic_name, unsigned int semantic_index)
+ {
+--- a/libs/vkd3d/shaders/cs_execute_indirect_unroll_draw.comp
++++ b/libs/vkd3d/shaders/cs_execute_indirect_unroll_draw.comp
+@@ -0,0 +1,150 @@
++#version 450
++#extension GL_EXT_buffer_reference : require
++
++/* Emulates the per-command root constants of ExecuteIndirect on a device with no
++ * VK_EXT_device_generated_commands.
++ *
++ * D3D12 lets a command signature set root arguments per command. Vulkan cannot
++ * source a push constant from a buffer, so the only way to give each command its
++ * own root constants is to give each command its own root parameter block and
++ * rebind a uniform buffer between draws. This shader builds those blocks, and
++ * unrolls the draw arguments into a tightly packed buffer at the same time so the
++ * caller can issue one single-command indirect draw per command.
++ *
++ * Commands at or beyond the indirect count get their arguments zeroed, which is
++ * how the count buffer is emulated once the multi-draw is broken up. Their source
++ * words are never read: the application only has to supply as many commands as
++ * the count buffer names, so reading past it would be an out of bounds fetch
++ * through a raw device address. */
++
++layout(local_size_x = 32) in;
++
++layout(buffer_reference_align = 4, std430, buffer_reference) readonly buffer Indirect
++{
++	uint values[];
++};
++
++layout(buffer_reference_align = 4, std430, buffer_reference) writeonly buffer IndirectOutput
++{
++	uint values[];
++};
++
++layout(buffer_reference_align = 4, std430, buffer_reference) readonly buffer IndirectCount
++{
++	uint value;
++};
++
++layout(buffer_reference_align = 4, std430, buffer_reference) readonly buffer RootTemplate
++{
++	uint values[];
++};
++
++layout(buffer_reference_align = 4, std430, buffer_reference) writeonly buffer RootOutput
++{
++	uint values[];
++};
++
++layout(buffer_reference_align = 4, std430, buffer_reference) writeonly buffer DrawCountOutput
++{
++	uint values[];
++};
++
++layout(push_constant) uniform Registers
++{
++	Indirect indirect;
++	IndirectCount count;
++	IndirectOutput out_args;
++	RootTemplate root_template;
++	RootOutput out_root;
++	DrawCountOutput out_counts;
++	uint stride_words;
++	uint max_commands;
++	uint action_word_offset;
++	uint action_words;
++	uint root_words;
++	uint root_block_stride_words;
++	uint constant_dest_word;
++	uint constant_words;
++	uint has_count;
++	uint chunk_blocks;
++};
++
++void main()
++{
++	uint cmd_index = gl_GlobalInvocationID.x;
++	if (cmd_index >= max_commands)
++		return;
++
++	/* count is a null reference when the application passed no count buffer, so
++	 * this has to be a branch, not a select. */
++	uint indirect_count = max_commands;
++	if (has_count != 0u)
++		indirect_count = count.value;
++
++	bool cmd_active = cmd_index < indirect_count;
++
++	/* One invocation per chunk records how many of that chunk's commands the count
++	 * buffer actually names, so the caller can issue the chunk as a draw-indirect-COUNT
++	 * and the command processor never fetches the ones past it. Zeroing a command's
++	 * arguments makes it draw nothing, but the GPU still fetches and retires the packet,
++	 * and on this game the declared count runs an order of magnitude above the real one -
++	 * so the zeroed commands, not the real ones, are most of the front end's work.
++	 *
++	 * The slots written are exactly the chunk starts the caller will loop over: its loop
++	 * steps by chunk_blocks from 0 while below max_commands, which is the same set as the
++	 * invocations below max_commands whose index divides by chunk_blocks. chunk_blocks is
++	 * 0 when the caller is not going to read this back, and out_counts is then a null
++	 * reference that is never dereferenced. */
++	if (chunk_blocks != 0u && (cmd_index % chunk_blocks) == 0u)
++	{
++		/* The count buffer may name more commands than the call declared; D3D12 takes
++		 * the smaller, and so does the arguments loop above through cmd_active. */
++		uint real = min(indirect_count, max_commands);
++		uint n = 0u;
++		if (real > cmd_index)
++			n = min(real - cmd_index, chunk_blocks);
++		out_counts.values[cmd_index / chunk_blocks] = n;
++	}
++
++	uint src = cmd_index * stride_words;
++	uint arg_dst = action_words * cmd_index;
++
++	for (uint i = 0u; i < action_words; i++)
++	{
++		uint value = 0u;
++		if (cmd_active)
++			value = indirect.values[src + action_word_offset + i];
++		out_args.values[arg_dst + i] = value;
++	}
++
++	/* Only the commands the count buffer named get a root parameter block.
++	 *
++	 * A command past the count has no shader invocation that could read one. Either its
++	 * chunk's draw count excludes it and the packet is never fetched, or - with per-chunk
++	 * counts off - it is fetched with the arguments zeroed above, and a draw of zero
++	 * indices runs no vertex or pixel shader. Nothing reads the block either way, so the
++	 * block is pure write traffic, and it is the great majority of this shader's work: 64
++	 * of the 69 words per command, as uncoalesced 4-byte stores at a 256-byte stride.
++	 *
++	 * The game this was written for declares far more commands than it draws - 16384
++	 * against a real count near fifty, and a session total of 3.15 billion declared
++	 * commands - so at 22 fps this was some 80 MB per frame of blocks that nothing could
++	 * ever index. The zeroing of the draw arguments above is deliberately left
++	 * unconditional: that is what makes a surplus command draw nothing when the caller
++	 * falls back to fixed-count draws, which happens whenever the bound pipeline vetoes
++	 * the DrawIndex-indexed blocks, and the patch pass cannot see that veto from here. */
++	if (cmd_active)
++	{
++		/* Start from the root parameter block the command list currently has bound,
++		 * so every root parameter the signature does not name keeps its API value. */
++		uint root_dst = root_block_stride_words * cmd_index;
++
++		for (uint i = 0u; i < root_words; i++)
++			out_root.values[root_dst + i] = root_template.values[i];
++
++		/* The root constants live at the front of the command, ahead of the action
++		 * argument, in the order the signature declared them. */
++		for (uint i = 0u; i < constant_words; i++)
++			out_root.values[root_dst + constant_dest_word + i] = indirect.values[src + i];
++	}
++}
